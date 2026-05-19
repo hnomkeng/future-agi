@@ -339,11 +339,7 @@ export default function TracesTab({ error }) {
                       project_id: projectId,
                       module: "project",
                     }
-                  : {
-                      trace_id: drawerTraceId,
-                      project_id: projectId,
-                      module: "project",
-                    }
+                  : { trace_id: drawerTraceId, project_id: projectId }
               }
               onClose={() => setDrawerTraceId(null)}
               onPrev={handlePrev}
