@@ -26,13 +26,7 @@ import {
   Typography,
 } from "@mui/material";
 import PropTypes from "prop-types";
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router";
 import Iconify from "src/components/iconify";
@@ -41,6 +35,13 @@ import axios, { endpoints } from "src/utils/axios";
 import { useDashboardFilterValues } from "src/hooks/useDashboards";
 import { useAIFilter } from "src/hooks/use-ai-filter";
 import { QueryInput } from "src/components/filter-panel";
+import {
+  getPickerOptionExactMatches,
+  getPickerOptionLabel,
+  getPickerOptionSearchText,
+  getPickerOptionSecondaryLabel,
+  getPickerOptionValue,
+} from "./filterValuePickerUtils";
 
 // ---------------------------------------------------------------------------
 // Trace filter fields (for Query tab via shared FilterPanel)
@@ -121,23 +122,30 @@ function mapCategory(raw) {
   return "system";
 }
 
+// `value` is the canonical backend op name; `label` is the dropdown text.
+// For strings/text: "equals"/"not equals" send `in`/`not_in` (`IN (x)` ≡ `= x`).
 const STRING_OPS = [
-  { value: "is", label: "is" },
-  { value: "is_not", label: "is not" },
+  { value: "in", label: "equals" },
+  { value: "not_in", label: "not equals" },
   { value: "contains", label: "contains" },
   { value: "not_contains", label: "not contains" },
   { value: "starts_with", label: "starts with" },
+  { value: "ends_with", label: "ends with" },
+  { value: "is_null", label: "is null" },
+  { value: "is_not_null", label: "is not null" },
 ];
 
 const NUMBER_OPS = [
-  { value: "equal_to", label: "equals" },
-  { value: "not_equal_to", label: "not equal" },
+  { value: "equals", label: "equals" },
+  { value: "not_equals", label: "not equals" },
   { value: "greater_than", label: "greater than" },
   { value: "greater_than_or_equal", label: "greater than or equals" },
   { value: "less_than", label: "less than" },
   { value: "less_than_or_equal", label: "less than or equals" },
   { value: "between", label: "between", range: true },
   { value: "not_between", label: "not between", range: true },
+  { value: "is_null", label: "is null" },
+  { value: "is_not_null", label: "is not null" },
 ];
 
 const DATE_OPS = [
@@ -148,7 +156,12 @@ const DATE_OPS = [
   { value: "not_between", label: "not between", range: true },
 ];
 
-const BOOLEAN_OPS = [{ value: "is", label: "is" }];
+const BOOLEAN_OPS = [
+  { value: "equals", label: "equals" },
+  { value: "not_equals", label: "not equals" },
+  { value: "is_null", label: "is null" },
+  { value: "is_not_null", label: "is not null" },
+];
 
 // thumbs_up_down annotations: 2 fixed display choices ("Thumbs Up"/"Thumbs Down").
 // Distinct from CATEGORICAL_OPS — we don't expose contains/not_contains for a
@@ -157,6 +170,8 @@ const THUMBS_OPS = [
   { value: "is", label: "is" },
   { value: "is_not", label: "is not" },
 ];
+
+const ANNOTATOR_OPS = [{ value: "is", label: "is" }];
 
 // Direct ID columns on `spans` — the dashboard filter pipeline resolves
 // them via equality only (no col_type, no LIKE/IN expansion), so any
@@ -179,25 +194,26 @@ const CATEGORICAL_OPS = [
 ];
 
 const TEXT_OPS = [
-  { value: "is", label: "is" },
-  { value: "is_not", label: "is not" },
+  { value: "in", label: "equals" },
+  { value: "not_in", label: "not equals" },
   { value: "contains", label: "contains" },
   { value: "not_contains", label: "not contains" },
   { value: "starts_with", label: "starts with" },
   { value: "ends_with", label: "ends with" },
+  { value: "is_null", label: "is null" },
+  { value: "is_not_null", label: "is not null" },
 ];
 
-// Map QueryInput operator keys → Basic tab operator keys
+// Identity maps; kept for the QueryInput integration call sites.
 const QUERY_TO_BASIC_OP = {
-  equals: "is",
-  not_equals: "is_not",
+  equals: "equals",
+  not_equals: "not_equals",
   starts_with: "starts_with",
 };
 
-// Reverse: Basic tab operator keys → QueryInput operator keys
 const BASIC_TO_QUERY_OP = {
-  is: "equals",
-  is_not: "not_equals",
+  equals: "equals",
+  not_equals: "not_equals",
   starts_with: "starts_with",
 };
 
@@ -229,6 +245,7 @@ const normalizeFieldType = (rawType) => {
 const getOperators = (fieldType) => {
   if (fieldType === "categorical") return CATEGORICAL_OPS;
   if (fieldType === "thumbs") return THUMBS_OPS;
+  if (fieldType === "annotator") return ANNOTATOR_OPS;
   if (fieldType === "text") return TEXT_OPS;
   const t = normalizeFieldType(fieldType);
   if (t === "number") return NUMBER_OPS;
@@ -246,16 +263,58 @@ const getOperatorsForFilter = (filter) => {
   return getOperators(filter?.fieldType);
 };
 
+const getDefaultOperatorForFilter = (filter, ops) => {
+  const defaultOp =
+    DEFAULT_OP_FOR_TYPE[filter?.fieldType] ||
+    DEFAULT_OP_FOR_TYPE[normalizeFieldType(filter?.fieldType)] ||
+    "is";
+  return ops.some((op) => op.value === defaultOp)
+    ? defaultOp
+    : ops[0]?.value || "is";
+};
+
+const getPanelOperatorAlias = (operator, filter) => {
+  const normalizedType = normalizeFieldType(filter?.fieldType);
+  if (operator === "equal_to") return "equals";
+  if (operator === "not_equal_to") return "not_equals";
+  if (operator === "in" || operator === "equals") {
+    if (normalizedType === "date") return "on";
+    return "is";
+  }
+  if (operator === "not_in" || operator === "not_equals") {
+    return "is_not";
+  }
+  if (operator === "not_in_between") return "not_between";
+  if (operator === "less_than" && normalizedType === "date") return "before";
+  if (operator === "greater_than" && normalizedType === "date") return "after";
+  return operator;
+};
+
+export const normalizeFilterRowOperator = (filter) => {
+  const ops = getOperatorsForFilter(filter);
+  if (ops.some((op) => op.value === filter?.operator)) return filter;
+
+  const alias = getPanelOperatorAlias(filter?.operator, filter);
+  const operator = ops.some((op) => op.value === alias)
+    ? alias
+    : getDefaultOperatorForFilter(filter, ops);
+  return { ...filter, operator };
+};
+
 const DEFAULT_OP_FOR_TYPE = {
-  number: "equal_to",
+  number: "equals",
   date: "on",
-  boolean: "is",
+  boolean: "equals",
   array: "contains",
-  string: "is",
+  string: "in",
   categorical: "is",
   thumbs: "is",
-  text: "is",
+  text: "in",
+  annotator: "is",
 };
+
+// Legacy string-field ops in saved views — rewrite on hydration so the menu renders.
+const HYDRATE_STRING_OP = { equals: "in", not_equals: "not_in" };
 
 const NO_VALUE_OPS = new Set([
   "is_empty",
@@ -264,20 +323,28 @@ const NO_VALUE_OPS = new Set([
   "is_not_null",
 ]);
 
+// Scalar ops — value picker forces single-select. Multi-value goes via in/not_in.
+const SINGLE_VALUE_OPS = new Set([
+  "equals",
+  "not_equals",
+  "contains",
+  "not_contains",
+  "starts_with",
+  "ends_with",
+]);
+
+// List ops — multi-select picker.
+const LIST_VALUE_OPS = new Set(["in", "not_in"]);
+
 // ---------------------------------------------------------------------------
 // Hook: fetch properties from dashboard metrics
 // ---------------------------------------------------------------------------
-// System metrics to exclude (not useful as trace filters)
-// System metrics to exclude — not useful as trace filters
+// System metrics to exclude — only the ones that are aggregate counts or
+// meta-fields with no per-trace value worth filtering on. Numeric metrics
+// like latency/tokens/cost ARE useful as rule and dashboard filters and
+// should stay in the picker.
 const EXCLUDED_METRICS = new Set([
   "project",
-  "latency",
-  "error_rate",
-  "tokens",
-  "input_tokens",
-  "output_tokens",
-  "time_to_first_token",
-  "cost",
   "session_count",
   "user_count",
   "trace_count",
@@ -285,99 +352,126 @@ const EXCLUDED_METRICS = new Set([
   "dataset",
   "eval_source",
   "row_count",
-  "prompt_tokens",
-  "completion_tokens",
-  "total_tokens",
-  "response_time",
   "cell_error_rate",
 ]);
+const PROPERTY_PICKER_RENDER_LIMIT = 250;
+
+const ANNOTATOR_FILTER_PROPERTY = {
+  id: "annotator",
+  name: "Annotator",
+  category: "annotation",
+  rawCategory: "annotation_metric",
+  type: "annotator",
+  // This is visually grouped with annotation filters, but the backend treats
+  // column_id=annotator as a global Score annotator filter, not a label column.
+  apiColType: "SYSTEM_METRIC",
+  allowCustomValue: false,
+};
+
+function metricToTraceFilterProperty(m) {
+  const outputType = m.outputType || m.output_type;
+  // Eval metrics don't carry a `type` field; derive the filter input type from
+  // `output_type`. SCORE → number (slider), PASS_FAIL/CHOICE/CHOICES → string
+  // (dropdown of choices).
+  const isEval = m.category === "eval_metric" || m.category === "evalMetric";
+  const isAnnotation =
+    m.category === "annotation_metric" || m.category === "annotationMetric";
+  let type;
+  if (isEval && outputType) {
+    const ot = String(outputType).toUpperCase();
+    if (ot === "SCORE") type = "number";
+    else type = "string";
+  } else if (isAnnotation && outputType) {
+    const ot = String(outputType).toLowerCase();
+    if (ot === "numeric" || ot === "star") type = "number";
+    else if (ot === "text") type = "text";
+    else if (ot === "thumbs_up_down") type = "thumbs";
+    else type = "categorical";
+  } else {
+    type = normalizeFieldType(m.type);
+  }
+  // thumbs labels have two fixed choices — surface them so the value picker
+  // renders a multi-select without needing a dashboard lookup.
+  const choices = type === "thumbs" ? ["Thumbs Up", "Thumbs Down"] : m.choices;
+  return {
+    id: m.name,
+    name: m.displayName || m.display_name || m.name,
+    category: mapCategory(m.category),
+    rawCategory: m.category,
+    type,
+    outputType,
+    choices,
+  };
+}
+
+export function buildTraceFilterProperties(
+  metrics,
+  { isSimulator = false } = {},
+) {
+  const properties = metrics
+    .filter((m) => {
+      const name = m.name;
+      const cat = m.category;
+      const src = m.source;
+
+      // Always exclude blacklisted metrics
+      if (EXCLUDED_METRICS.has(name)) return false;
+
+      // Exclude dataset-only metrics
+      if (src === "datasets") return false;
+
+      // Exclude simulation metrics for non-simulator projects
+      if (src === "simulation" && !isSimulator) return false;
+
+      // Exclude custom_column (dataset columns)
+      if (cat === "custom_column" || cat === "customColumn") return false;
+
+      // System metrics: string and number types
+      if (cat === "system_metric" || cat === "systemMetric") {
+        const normalized = normalizeFieldType(m.type);
+        return normalized === "string" || normalized === "number";
+      }
+
+      // Evals, annotations, custom attributes — include
+      if (cat === "eval_metric" || cat === "evalMetric") return true;
+      if (cat === "annotation_metric" || cat === "annotationMetric")
+        return true;
+      if (cat === "custom_attribute" || cat === "customAttribute") return true;
+
+      return false;
+    })
+    .map(metricToTraceFilterProperty);
+
+  const firstAnnotationIndex = properties.findIndex(
+    (property) => property.category === "annotation",
+  );
+  const alreadyHasAnnotator = properties.some(
+    (property) => property.id === ANNOTATOR_FILTER_PROPERTY.id,
+  );
+
+  if (firstAnnotationIndex !== -1 && !alreadyHasAnnotator) {
+    properties.splice(firstAnnotationIndex, 0, ANNOTATOR_FILTER_PROPERTY);
+  }
+
+  return properties;
+}
 
 function useTraceFilterProperties(
   projectId,
   { enabled = true, isSimulator = false } = {},
 ) {
   return useQuery({
-    queryKey: ["trace-filter-properties-v2", projectId],
-    enabled,
+    queryKey: ["trace-filter-properties-v2", projectId, isSimulator],
+    enabled: enabled && Boolean(projectId),
     queryFn: async () => {
       const params = {};
       if (projectId) params.project_ids = projectId;
       const { data } = await axios.get(endpoints.dashboard.metrics, { params });
       return data?.result?.metrics || [];
     },
-    select: (metrics) =>
-      metrics
-        .filter((m) => {
-          const name = m.name;
-          const cat = m.category;
-          const src = m.source;
-
-          // Always exclude blacklisted metrics
-          if (EXCLUDED_METRICS.has(name)) return false;
-
-          // Exclude dataset-only metrics
-          if (src === "datasets") return false;
-
-          // Exclude simulation metrics for non-simulator projects
-          if (src === "simulation" && !isSimulator) return false;
-
-          // Exclude custom_column (dataset columns)
-          if (cat === "custom_column" || cat === "customColumn") return false;
-
-          // System metrics: string and number types
-          if (cat === "system_metric" || cat === "systemMetric") {
-            const normalized = normalizeFieldType(m.type);
-            return normalized === "string" || normalized === "number";
-          }
-
-          // Evals, annotations, custom attributes — include
-          if (cat === "eval_metric" || cat === "evalMetric") return true;
-          if (cat === "annotation_metric" || cat === "annotationMetric")
-            return true;
-          if (cat === "custom_attribute" || cat === "customAttribute")
-            return true;
-
-          return false;
-        })
-        .map((m) => {
-          const outputType = m.outputType || m.output_type;
-          // Eval metrics don't carry a `type` field; derive the filter
-          // input type from `output_type`. SCORE → number (slider),
-          // PASS_FAIL/CHOICE/CHOICES → string (dropdown of choices).
-          const isEval =
-            m.category === "eval_metric" || m.category === "evalMetric";
-          const isAnnotation =
-            m.category === "annotation_metric" ||
-            m.category === "annotationMetric";
-          let type;
-          if (isEval && outputType) {
-            const ot = String(outputType).toUpperCase();
-            if (ot === "SCORE") type = "number";
-            else type = "string";
-          } else if (isAnnotation && outputType) {
-            const ot = String(outputType).toLowerCase();
-            if (ot === "numeric" || ot === "star") type = "number";
-            else if (ot === "text") type = "text";
-            else if (ot === "thumbs_up_down") type = "thumbs";
-            else type = "categorical";
-          } else {
-            type = normalizeFieldType(m.type);
-          }
-          // thumbs labels have two fixed choices — surface them so the value
-          // picker renders a multi-select without needing a dashboard lookup.
-          const choices =
-            type === "thumbs" ? ["Thumbs Up", "Thumbs Down"] : m.choices;
-          return {
-            id: m.name,
-            name: m.displayName || m.display_name || m.name,
-            category: mapCategory(m.category),
-            rawCategory: m.category,
-            type,
-            outputType,
-            choices,
-          };
-        }),
-    staleTime: 60_000,
+    select: (metrics) => buildTraceFilterProperties(metrics, { isSimulator }),
+    staleTime: 5 * 60_000,
+    gcTime: 15 * 60_000,
   });
 }
 
@@ -415,6 +509,11 @@ function PropertyPicker({
     for (const p of properties) c[p.category] = (c[p.category] || 0) + 1;
     return c;
   }, [properties]);
+  const visibleProperties = filtered.slice(0, PROPERTY_PICKER_RENDER_LIMIT);
+  const hiddenCount = Math.max(
+    filtered.length - PROPERTY_PICKER_RENDER_LIMIT,
+    0,
+  );
 
   const paperWidth = hasCategorySidebar ? 480 : 320;
 
@@ -552,9 +651,9 @@ function PropertyPicker({
                   No properties found
                 </Typography>
               )}
-              {filtered.map((prop) => (
+              {visibleProperties.map((prop, idx) => (
                 <Box
-                  key={prop.id}
+                  key={`${prop.category}:${prop.id}:${idx}`}
                   onClick={() => {
                     onSelect(prop);
                     onClose();
@@ -612,6 +711,20 @@ function PropertyPicker({
                   )}
                 </Box>
               ))}
+              {hiddenCount > 0 && (
+                <Typography
+                  sx={{
+                    px: 1.5,
+                    py: 1,
+                    fontSize: 11,
+                    color: "text.secondary",
+                    borderTop: "1px solid",
+                    borderColor: "divider",
+                  }}
+                >
+                  {hiddenCount} more properties. Search to narrow the list.
+                </Typography>
+              )}
             </Box>
           </Box>
         </Paper>
@@ -630,6 +743,16 @@ const SESSION_VALUE_FIELDS = new Set([
   "first_message",
   "last_message",
 ]);
+
+const FREE_TEXT_NO_OPTIONS_TEXT = "No suggestions yet — type a value to add it";
+
+function normalizePickerValues(values) {
+  const rawValues = Array.isArray(values) ? values : values ? [values] : [];
+  const cleanValues = rawValues
+    .map((item) => String(getPickerOptionValue(item)).trim())
+    .filter(Boolean);
+  return Array.from(new Set(cleanValues));
+}
 
 function ValuePicker({
   propertyId,
@@ -651,7 +774,9 @@ function ValuePicker({
   // not indexed by the dashboard metrics pipeline or when options are known
   // client-side.
   const hasStaticChoices =
-    Array.isArray(property?.choices) && property.choices.length > 0;
+    propertyCategory !== "annotation" &&
+    Array.isArray(property?.choices) &&
+    property.choices.length > 0;
 
   const metricType = (() => {
     if (propertyCategory === "system") return "system_metric";
@@ -674,7 +799,7 @@ function ValuePicker({
     metricType,
     projectIds: projectId ? [projectId] : [],
     source,
-    enabled: !hasStaticChoices,
+    enabled: !hasStaticChoices && Boolean(anchorEl),
   });
 
   // Fallback: session filter values endpoint (for session-specific fields)
@@ -712,15 +837,18 @@ function ValuePicker({
   const filtered = useMemo(() => {
     if (!search || isSessionField) return options; // session endpoint already filters server-side
     const q = search.toLowerCase();
-    return options.filter((o) => {
-      const label = typeof o === "string" ? o : o.label || o.value || "";
-      return label.toLowerCase().includes(q);
-    });
+    return options.filter((o) =>
+      getPickerOptionSearchText(o).toLowerCase().includes(q),
+    );
   }, [options, search, isSessionField]);
+
+  const selectedValues = useMemo(() => normalizePickerValues(value), [value]);
 
   const toggleValue = useCallback(
     (val) => {
-      const strVal = typeof val === "string" ? val : val.value;
+      // Use the shared helper to read the picker option's stable value
+      // (handles both string and {value, label} object shapes).
+      const strVal = getPickerOptionValue(val);
       if (singleSelect) {
         // Clicking the already-selected value clears; clicking a different
         // value replaces — standard single-select dropdown UX.
@@ -728,12 +856,25 @@ function ValuePicker({
         return;
       }
       onChange(
-        value.includes(strVal)
-          ? value.filter((v) => v !== strVal)
-          : [...value, strVal],
+        selectedValues.includes(strVal)
+          ? selectedValues.filter((v) => v !== strVal)
+          : [...selectedValues, strVal],
       );
     },
-    [value, onChange, singleSelect],
+    [selectedValues, value, onChange, singleSelect],
+  );
+
+  const customSearchValue = search.trim();
+  const searchMatchesExistingOption = options.some((option) =>
+    getPickerOptionExactMatches(option).some(
+      (matchValue) =>
+        matchValue.toLowerCase() === customSearchValue.toLowerCase(),
+    ),
+  );
+  const showCustomValueRow = Boolean(
+    property?.allowCustomValue !== false &&
+      customSearchValue &&
+      !searchMatchesExistingOption,
   );
 
   return (
@@ -746,9 +887,9 @@ function ValuePicker({
           gap: 0.5,
           flexWrap: "wrap",
           minHeight: 28,
-          minWidth: 120,
-          flex: 1,
-          maxWidth: 250,
+          minWidth: 0,
+          flex: "1 1 180px",
+          maxWidth: "100%",
           px: 1,
           py: 0.25,
           border: "1px solid",
@@ -758,7 +899,7 @@ function ValuePicker({
           "&:hover": { borderColor: "text.disabled" },
         }}
       >
-        {value.length === 0 ? (
+        {selectedValues.length === 0 ? (
           <Typography sx={{ fontSize: 12, color: "text.disabled", flex: 1 }}>
             {isLoading
               ? "Loading..."
@@ -767,7 +908,7 @@ function ValuePicker({
                 : "Select values..."}
           </Typography>
         ) : (
-          value.slice(0, 3).map((v) => {
+          selectedValues.slice(0, 3).map((v) => {
             // Resolve the display label from static choices or rendered
             // options. Falls back to the raw value (e.g. plain strings
             // without a label).
@@ -777,14 +918,19 @@ function ValuePicker({
             });
             const displayLabel =
               (typeof match === "string" ? match : match?.label) || v;
+            const secondaryLabel = getPickerOptionSecondaryLabel(match);
+            const chipTitle = secondaryLabel
+              ? `${displayLabel} (${secondaryLabel})`
+              : displayLabel;
             return (
               <Chip
                 key={v}
                 label={displayLabel}
+                title={chipTitle}
                 size="small"
                 onDelete={(e) => {
                   e.stopPropagation();
-                  onChange(value.filter((x) => x !== v));
+                  onChange(selectedValues.filter((x) => x !== v));
                 }}
                 deleteIcon={<Iconify icon="mdi:close" width={10} />}
                 sx={{
@@ -797,9 +943,9 @@ function ValuePicker({
             );
           })
         )}
-        {value.length > 3 && (
+        {selectedValues.length > 3 && (
           <Typography sx={{ fontSize: 10, color: "text.disabled" }}>
-            +{value.length - 3}
+            +{selectedValues.length - 3}
           </Typography>
         )}
         <Iconify
@@ -819,7 +965,9 @@ function ValuePicker({
         anchorOrigin={{ vertical: "bottom", horizontal: "left" }}
         transformOrigin={{ vertical: "top", horizontal: "left" }}
         slotProps={{
-          paper: { sx: { width: 260, borderRadius: "8px", mt: 0.5 } },
+          paper: {
+            sx: { width: { xs: 280, sm: 320 }, borderRadius: "8px", mt: 0.5 },
+          },
         }}
       >
         <Box sx={{ p: 1 }}>
@@ -869,63 +1017,17 @@ function ValuePicker({
             >
               {isError
                 ? "Values not available for this property"
-                : "No values found"}
+                : FREE_TEXT_NO_OPTIONS_TEXT}
             </Typography>
           )}
-          {/* Specify custom value — fallback when the typed value isn't in
-              the fetched list (empty API response, errored endpoint, or a
-              value the user knows but isn't in the sample). */}
-          {search &&
-            !options.some((o) => {
-              const ov = typeof o === "string" ? o : o.value;
-              return ov === search;
-            }) && (
-              <Box
-                onClick={() => {
-                  if (singleSelect) {
-                    onChange([search]);
-                  } else if (!value.includes(search)) {
-                    onChange([...value, search]);
-                  }
-                  setSearch("");
-                }}
-                sx={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 1,
-                  px: 1.5,
-                  py: 0.75,
-                  cursor: "pointer",
-                  bgcolor: value.includes(search)
-                    ? "action.selected"
-                    : "transparent",
-                  "&:hover": { bgcolor: "action.hover" },
-                }}
-              >
-                <Iconify
-                  icon={
-                    value.includes(search)
-                      ? "mdi:checkbox-marked"
-                      : "mdi:checkbox-blank-outline"
-                  }
-                  width={18}
-                  sx={{
-                    color: value.includes(search)
-                      ? "primary.main"
-                      : "text.secondary",
-                    flexShrink: 0,
-                  }}
-                />
-                <Typography sx={{ fontSize: 12 }}>
-                  Specify: <strong>{search}</strong>
-                </Typography>
-              </Box>
-            )}
+          {/* Custom-value row is rendered below in the showCustomValueRow
+              block — keeps a single source of truth for the "Specify"
+              fallback (search did not match any fetched option). */}
           {filtered.map((opt) => {
-            const strVal = typeof opt === "string" ? opt : opt.value;
-            const label =
-              typeof opt === "string" ? opt : opt.label || opt.value;
-            const isSelected = value.includes(strVal);
+            const strVal = getPickerOptionValue(opt);
+            const label = getPickerOptionLabel(opt);
+            const secondaryLabel = getPickerOptionSecondaryLabel(opt);
+            const isSelected = selectedValues.includes(strVal);
             return (
               <Box
                 key={strVal}
@@ -935,7 +1037,7 @@ function ValuePicker({
                   alignItems: "center",
                   gap: 1,
                   px: 1.5,
-                  py: 0.75,
+                  py: secondaryLabel ? 0.65 : 0.75,
                   cursor: "pointer",
                   bgcolor: isSelected ? "action.selected" : "transparent",
                   "&:hover": { bgcolor: "action.hover" },
@@ -953,23 +1055,71 @@ function ValuePicker({
                     flexShrink: 0,
                   }}
                 />
-                <Typography
-                  noWrap
-                  sx={{
-                    fontSize: 12,
-                    flex: 1,
-                    maxWidth: 180,
-                    fontWeight: isSelected ? 600 : 400,
-                    color: isSelected ? "text.primary" : "text.primary",
-                  }}
-                >
-                  {label}
-                </Typography>
+                <Box sx={{ flex: 1, minWidth: 0 }}>
+                  <Typography
+                    noWrap
+                    title={label}
+                    sx={{
+                      fontSize: 12,
+                      fontWeight: isSelected ? 600 : 400,
+                      color: "text.primary",
+                    }}
+                  >
+                    {label}
+                  </Typography>
+                  {secondaryLabel && (
+                    <Typography
+                      noWrap
+                      title={secondaryLabel}
+                      sx={{ fontSize: 10, color: "text.secondary", mt: 0.1 }}
+                    >
+                      {secondaryLabel}
+                    </Typography>
+                  )}
+                </Box>
               </Box>
             );
           })}
+          {showCustomValueRow && (
+            <>
+              {filtered.length > 0 && <Divider />}
+              <Box
+                onClick={() => {
+                  // singleSelect: replace the selection. Otherwise: append
+                  // (but skip if the value is already selected).
+                  if (singleSelect) {
+                    onChange([customSearchValue]);
+                  } else if (!selectedValues.includes(customSearchValue)) {
+                    onChange([...selectedValues, customSearchValue]);
+                  }
+                  setSearch("");
+                }}
+                sx={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 1,
+                  px: 1.5,
+                  py: 0.75,
+                  cursor: "pointer",
+                  "&:hover": { bgcolor: "action.hover" },
+                }}
+              >
+                <Iconify
+                  icon="mdi:plus-circle-outline"
+                  width={18}
+                  sx={{
+                    color: "primary.main",
+                    flexShrink: 0,
+                  }}
+                />
+                <Typography sx={{ fontSize: 12 }}>
+                  + Specify: <strong>{customSearchValue}</strong>
+                </Typography>
+              </Box>
+            </>
+          )}
         </Box>
-        {value.length > 0 && (
+        {selectedValues.length > 0 && (
           <>
             <Divider />
             <Box
@@ -981,7 +1131,7 @@ function ValuePicker({
               }}
             >
               <Typography sx={{ fontSize: 11, color: "text.secondary" }}>
-                {value.length} selected
+                {selectedValues.length} selected
               </Typography>
               <Button
                 size="small"
@@ -1017,6 +1167,7 @@ function FilterRow({
   source = "traces",
   ValuePickerOverride,
   categories,
+  freeSoloValues = false,
 }) {
   const [pickerAnchor, setPickerAnchor] = useState(null);
   const selectedProp = properties.find((p) => p.id === filter.field);
@@ -1025,7 +1176,21 @@ function FilterRow({
   const isDate = normalizedType === "date";
   const isBoolean = normalizedType === "boolean";
   const ops = getOperatorsForFilter(filter);
-  const currentOpDef = ops.find((o) => o.value === filter.operator);
+  const safeOperator = normalizeFilterRowOperator(filter).operator;
+  const currentOpDef = ops.find((o) => o.value === safeOperator);
+  const updateRow = useCallback(
+    (changes) =>
+      onChange(index, {
+        ...filter,
+        operator: safeOperator,
+        ...changes,
+      }),
+    [filter, index, onChange, safeOperator],
+  );
+  const rowFreeSoloValues =
+    typeof freeSoloValues === "function"
+      ? freeSoloValues(filter)
+      : freeSoloValues;
 
   const handlePropertySelect = useCallback(
     (prop) => {
@@ -1035,10 +1200,11 @@ function FilterRow({
       const nt =
         prop.type === "categorical" ||
         prop.type === "thumbs" ||
-        prop.type === "text"
+        prop.type === "text" ||
+        prop.type === "annotator"
           ? prop.type
           : normalizeFieldType(prop.type);
-      const defaultOp = DEFAULT_OP_FOR_TYPE[nt] || "is";
+      const defaultOp = DEFAULT_OP_FOR_TYPE[nt] || "equals";
       let defaultValue;
       if (nt === "number" || nt === "date") defaultValue = "";
       else if (nt === "boolean") defaultValue = "true";
@@ -1049,6 +1215,7 @@ function FilterRow({
         fieldName: prop.name,
         fieldCategory: prop.category,
         fieldType: nt,
+        apiColType: prop.apiColType,
         operator: defaultOp,
         value: defaultValue,
       });
@@ -1061,16 +1228,27 @@ function FilterRow({
       const newOp = e.target.value;
       const opList = getOperatorsForFilter(filter);
       const newDef = opList.find((o) => o.value === newOp);
-      const oldDef = opList.find((o) => o.value === filter.operator);
+      const oldDef = opList.find((o) => o.value === safeOperator);
       let newVal = filter.value;
       if (isNumber || isDate) {
         if (newDef?.range && !oldDef?.range) newVal = ["", ""];
         else if (!newDef?.range && oldDef?.range) newVal = "";
       }
       if (NO_VALUE_OPS.has(newOp)) newVal = "";
+      // Multi → single: drop stale extra picks.
+      if (SINGLE_VALUE_OPS.has(newOp) && Array.isArray(newVal) && newVal.length > 1) {
+        newVal = [newVal[0]];
+      }
+      // Single → list: picker expects an array.
+      if (LIST_VALUE_OPS.has(newOp) && !Array.isArray(newVal)) {
+        newVal =
+          newVal === "" || newVal === null || newVal === undefined
+            ? []
+            : [newVal];
+      }
       onChange(index, { ...filter, operator: newOp, value: newVal });
     },
-    [index, filter, isNumber, isDate, onChange],
+    [index, filter, safeOperator, isNumber, isDate, onChange],
   );
 
   const renderValueInput = () => {
@@ -1093,7 +1271,7 @@ function FilterRow({
       );
     }
 
-    if (NO_VALUE_OPS.has(filter.operator)) {
+    if (NO_VALUE_OPS.has(safeOperator)) {
       return <Box sx={{ flex: 1 }} />;
     }
 
@@ -1102,9 +1280,7 @@ function FilterRow({
         <Select
           size="small"
           value={filter.value ?? "true"}
-          onChange={(e) =>
-            onChange(index, { ...filter, value: e.target.value })
-          }
+          onChange={(e) => updateRow({ value: e.target.value })}
           sx={{
             flex: 1,
             minWidth: 80,
@@ -1130,7 +1306,12 @@ function FilterRow({
             direction="row"
             alignItems="center"
             gap={0.5}
-            sx={{ flex: 1, minWidth: 180, maxWidth: 280 }}
+            sx={{
+              flex: "1 1 220px",
+              minWidth: 0,
+              maxWidth: "100%",
+              flexWrap: { xs: "wrap", sm: "nowrap" },
+            }}
           >
             <TextField
               size="small"
@@ -1141,9 +1322,9 @@ function FilterRow({
                   ? [...filter.value]
                   : ["", ""];
                 cur[0] = e.target.value;
-                onChange(index, { ...filter, value: cur });
+                updateRow({ value: cur });
               }}
-              sx={{ flex: 1 }}
+              sx={{ flex: "1 1 120px", minWidth: 0 }}
               inputProps={{
                 style: { fontSize: 11, height: 12, padding: "6px 6px" },
               }}
@@ -1160,9 +1341,9 @@ function FilterRow({
                   ? [...filter.value]
                   : ["", ""];
                 cur[1] = e.target.value;
-                onChange(index, { ...filter, value: cur });
+                updateRow({ value: cur });
               }}
-              sx={{ flex: 1 }}
+              sx={{ flex: "1 1 120px", minWidth: 0 }}
               inputProps={{
                 style: { fontSize: 11, height: 12, padding: "6px 6px" },
               }}
@@ -1175,10 +1356,8 @@ function FilterRow({
           size="small"
           type="datetime-local"
           value={typeof filter.value === "string" ? filter.value : ""}
-          onChange={(e) =>
-            onChange(index, { ...filter, value: e.target.value })
-          }
-          sx={{ flex: 1, minWidth: 140, maxWidth: 200 }}
+          onChange={(e) => updateRow({ value: e.target.value })}
+          sx={{ flex: "1 1 160px", minWidth: 0, maxWidth: "100%" }}
           inputProps={{
             style: { fontSize: 11, height: 12, padding: "6px 6px" },
           }}
@@ -1193,7 +1372,12 @@ function FilterRow({
             direction="row"
             alignItems="center"
             gap={0.5}
-            sx={{ flex: 1, minWidth: 120, maxWidth: 200 }}
+            sx={{
+              flex: "1 1 180px",
+              minWidth: 0,
+              maxWidth: "100%",
+              flexWrap: { xs: "wrap", sm: "nowrap" },
+            }}
           >
             <TextField
               size="small"
@@ -1205,9 +1389,9 @@ function FilterRow({
                   ? [...filter.value]
                   : ["", ""];
                 cur[0] = e.target.value;
-                onChange(index, { ...filter, value: cur });
+                updateRow({ value: cur });
               }}
-              sx={{ flex: 1 }}
+              sx={{ flex: "1 1 80px", minWidth: 0 }}
               inputProps={{
                 style: { fontSize: 12, height: 12, padding: "6px 8px" },
               }}
@@ -1225,9 +1409,9 @@ function FilterRow({
                   ? [...filter.value]
                   : ["", ""];
                 cur[1] = e.target.value;
-                onChange(index, { ...filter, value: cur });
+                updateRow({ value: cur });
               }}
-              sx={{ flex: 1 }}
+              sx={{ flex: "1 1 80px", minWidth: 0 }}
               inputProps={{
                 style: { fontSize: 12, height: 12, padding: "6px 8px" },
               }}
@@ -1241,10 +1425,8 @@ function FilterRow({
           type="number"
           placeholder="Value"
           value={filter.value ?? ""}
-          onChange={(e) =>
-            onChange(index, { ...filter, value: e.target.value })
-          }
-          sx={{ flex: 1, minWidth: 80, maxWidth: 140 }}
+          onChange={(e) => updateRow({ value: e.target.value })}
+          sx={{ flex: "1 1 120px", minWidth: 0, maxWidth: "100%" }}
           inputProps={{
             style: { fontSize: 12, height: 12, padding: "6px 8px" },
           }}
@@ -1258,10 +1440,8 @@ function FilterRow({
           size="small"
           placeholder="Enter text..."
           value={filter.value ?? ""}
-          onChange={(e) =>
-            onChange(index, { ...filter, value: e.target.value })
-          }
-          sx={{ flex: 1, minWidth: 120, maxWidth: 200 }}
+          onChange={(e) => updateRow({ value: e.target.value })}
+          sx={{ flex: "1 1 160px", minWidth: 0, maxWidth: "100%" }}
           inputProps={{
             style: { fontSize: 12, height: 12, padding: "6px 8px" },
           }}
@@ -1279,14 +1459,23 @@ function FilterRow({
         value={filter.value}
         source={source}
         property={properties.find((p) => p.id === filter.field)}
-        singleSelect={ID_ONLY_FIELDS.has(filter.field)}
-        onChange={(newVal) => onChange(index, { ...filter, value: newVal })}
+        freeSoloValues={rowFreeSoloValues}
+        singleSelect={
+          ID_ONLY_FIELDS.has(filter.field) ||
+          SINGLE_VALUE_OPS.has(safeOperator)
+        }
+        onChange={(newVal) => updateRow({ value: newVal })}
       />
     );
   };
 
   return (
-    <Stack direction="row" alignItems="center" gap={0.5}>
+    <Stack
+      direction="row"
+      alignItems="center"
+      gap={0.5}
+      sx={{ width: "100%", minWidth: 0, flexWrap: "wrap" }}
+    >
       <CustomTooltip
         show={!!selectedProp?.name}
         arrow
@@ -1304,8 +1493,9 @@ function FilterRow({
             textTransform: "none",
             fontSize: 12,
             height: 28,
-            minWidth: 100,
-            maxWidth: 150,
+            flex: "1 1 150px",
+            minWidth: 0,
+            maxWidth: { xs: "100%", sm: 180 },
             borderColor: "divider",
             color: filter.field ? "text.primary" : "text.disabled",
             justifyContent: "space-between",
@@ -1315,7 +1505,7 @@ function FilterRow({
             noWrap
             sx={{
               fontSize: 12,
-              maxWidth: 100,
+              maxWidth: "100%",
               overflow: "hidden",
               textOverflow: "ellipsis",
             }}
@@ -1335,9 +1525,15 @@ function FilterRow({
 
       <Select
         size="small"
-        value={filter.operator || (isNumber ? "equal_to" : "is")}
+        value={safeOperator}
         onChange={handleOperatorChange}
-        sx={{ minWidth: 70, fontSize: 12, height: 28 }}
+        sx={{
+          flex: "0 1 128px",
+          minWidth: 90,
+          maxWidth: { xs: "100%", sm: 150 },
+          fontSize: 12,
+          height: 28,
+        }}
       >
         {ops.map((op) => (
           <MenuItem key={op.value} value={op.value} sx={{ fontSize: 12 }}>
@@ -1351,7 +1547,7 @@ function FilterRow({
       <IconButton
         size="small"
         onClick={() => onRemove(index)}
-        sx={{ p: 0.25, flexShrink: 0 }}
+        sx={{ p: 0.25, flexShrink: 0, ml: "auto" }}
       >
         <Iconify icon="mdi:close" width={14} />
       </IconButton>
@@ -1365,7 +1561,7 @@ function FilterRow({
 const DEFAULT_ROW = {
   field: "",
   fieldCategory: "system",
-  operator: "is",
+  operator: "in",
   value: [],
 };
 
@@ -1387,6 +1583,7 @@ const TraceFilterPanel = ({
   panelWidth,
   defaultRow: defaultRowOverride,
   isSimulator = false,
+  freeSoloValues = false,
   isSpansView = false,
 }) => {
   const { observeId: routeObserveId } = useParams();
@@ -1406,7 +1603,12 @@ const TraceFilterPanel = ({
     const ID_FIELDS = new Set(["trace_id", "span_id"]);
     const staticProps = getTraceFilterFields(tab).map((f) => {
       if (isSpansView && f.value === "name") {
-        return { id: "name", name: "Span Name", category: "system", type: "string" };
+        return {
+          id: "name",
+          name: "Span Name",
+          category: "system",
+          type: "string",
+        };
       }
       return {
         id: f.value,
@@ -1433,6 +1635,10 @@ const TraceFilterPanel = ({
       }));
     return [...staticProps, ...dynamicExtras, ...fieldExtras];
   }, [dynamicProperties, filterFields, propertiesOverride, tab, isSpansView]);
+  const propertyById = useMemo(
+    () => Object.fromEntries(properties.map((p) => [p.id, p])),
+    [properties],
+  );
   const propsLoading = skipDynamicProperties ? false : dynamicPropsLoading;
   const effectiveCategories = categoriesOverride ?? CATEGORIES;
   const effectiveDefaultRow = defaultRowOverride || DEFAULT_ROW;
@@ -1467,8 +1673,11 @@ const TraceFilterPanel = ({
       properties.map((p) => ({
         value: p.id,
         label: p.name,
-        type: "string",
+        type: p.choices?.length ? "enum" : "string",
+        choices: p.choices,
+        panelType: p.type || "string",
         category: p.category, // system, eval, annotation, attribute
+        apiColType: p.apiColType,
       })),
     [properties],
   );
@@ -1501,12 +1710,38 @@ const TraceFilterPanel = ({
       if (currentFilters?.length) {
         // Enrich rows with fieldCategory and fieldType from properties lookup
         const enriched = currentFilters.map((f) => {
-          const prop = properties.find((p) => p.id === f.field);
-          return {
+          const prop = propertyById[f.field];
+          const fieldType = f.fieldType || prop?.type || "string";
+          // ID-only fields (trace_id / span_id) bypass the string-op
+          // rewrite — ID_ONLY_OPS = [{ value: "is" }] so anything other
+          // than "is" renders blank in the operator Select.
+          const hydratedOp = ID_ONLY_FIELDS.has(f.field)
+            ? "is"
+            : (fieldType === "string" || fieldType === "text") &&
+                HYDRATE_STRING_OP[f.operator]
+              ? HYDRATE_STRING_OP[f.operator]
+              : f.operator;
+          // Scalar legacy `equals` value → array for the multi-select picker.
+          let value = f.value;
+          if (
+            hydratedOp !== f.operator &&
+            LIST_VALUE_OPS.has(hydratedOp) &&
+            !Array.isArray(value)
+          ) {
+            value =
+              value === "" || value === null || value === undefined
+                ? []
+                : [value];
+          }
+          return normalizeFilterRowOperator({
             ...f,
             fieldCategory: f.fieldCategory || prop?.category || "system",
-            fieldType: f.fieldType || prop?.type || "string",
-          };
+            fieldName: f.fieldName || prop?.name,
+            fieldType,
+            apiColType: f.apiColType || prop?.apiColType,
+            operator: hydratedOp,
+            value,
+          });
         });
         setRows(enriched);
       } else {
@@ -1514,6 +1749,29 @@ const TraceFilterPanel = ({
       }
     }
   }, [open, currentFilters]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleQueryTokensChange = useCallback(
+    (tokens) => {
+      const converted = tokens.map((t) => {
+        const queryFieldDef = queryFieldMap[t.field];
+        const prop = propertyById[t.field];
+        return {
+          field: t.field,
+          fieldName: prop?.name || queryFieldDef?.label,
+          fieldCategory: prop?.category || queryFieldDef?.category || "system",
+          fieldType:
+            prop?.type ||
+            queryFieldDef?.panelType ||
+            (queryFieldDef?.type === "enum" ? "categorical" : "string"),
+          apiColType: prop?.apiColType || queryFieldDef?.apiColType,
+          operator: QUERY_TO_BASIC_OP[t.operator] || t.operator,
+          value: Array.isArray(t.value) ? t.value : [t.value],
+        };
+      });
+      setRows(converted.length ? converted : [{ ...effectiveDefaultRow }]);
+    },
+    [effectiveDefaultRow, propertyById, queryFieldMap],
+  );
 
   const handleChange = useCallback((idx, updated) => {
     setRows((prev) => prev.map((r, i) => (i === idx ? updated : r)));
@@ -1530,7 +1788,7 @@ const TraceFilterPanel = ({
   );
 
   const handleApply = useCallback(() => {
-    const valid = rows.filter((r) => {
+    const valid = rows.map(normalizeFilterRowOperator).filter((r) => {
       if (!r.field) return false;
       if (NO_VALUE_OPS.has(r.operator)) return true;
       const ops = getOperatorsForFilter(r);
@@ -1560,11 +1818,13 @@ const TraceFilterPanel = ({
     if (aiFilters.length > 0) {
       const converted = aiFilters.map((f) => {
         const prop = properties.find((p) => p.id === f.field);
+        const fieldType = prop?.type || "string";
         return {
           field: f.field,
           fieldCategory: prop?.category || "system",
-          fieldType: prop?.type || "string",
-          operator: f.operator || "is",
+          fieldType,
+          apiColType: prop?.apiColType,
+          operator: f.operator || DEFAULT_OP_FOR_TYPE[fieldType] || "equals",
           value: Array.isArray(f.value) ? f.value : [f.value],
         };
       });
@@ -1585,10 +1845,12 @@ const TraceFilterPanel = ({
       slotProps={{
         paper: {
           sx: {
-            width: panelWidth || 560,
+            width: { xs: "calc(100vw - 24px)", sm: panelWidth || 560 },
+            maxWidth: "calc(100vw - 24px)",
             borderRadius: "10px",
             mt: 0.5,
             p: 1,
+            overflowX: "hidden",
           },
         },
       }}
@@ -1704,6 +1966,7 @@ const TraceFilterPanel = ({
                     source={source}
                     ValuePickerOverride={ValuePickerOverride}
                     categories={effectiveCategories}
+                    freeSoloValues={freeSoloValues}
                   />
                 ))}
               </Stack>
@@ -1712,7 +1975,7 @@ const TraceFilterPanel = ({
               direction="row"
               justifyContent="space-between"
               alignItems="center"
-              sx={{ mt: 1.5 }}
+              sx={{ mt: 1.5, gap: 1, flexWrap: "wrap" }}
             >
               <Button
                 size="small"
@@ -1728,7 +1991,7 @@ const TraceFilterPanel = ({
               >
                 Add filter
               </Button>
-              <Stack direction="row" spacing={1}>
+              <Stack direction="row" spacing={1} sx={{ ml: "auto" }}>
                 <Button
                   size="small"
                   onClick={handleClear}
@@ -1759,18 +2022,7 @@ const TraceFilterPanel = ({
             <QueryInput
               filterFields={queryFilterFields}
               fieldMap={queryFieldMap}
-              onApply={(tokens) => {
-                const converted = tokens.map((t) => ({
-                  field: t.field,
-                  fieldCategory:
-                    properties.find((p) => p.id === t.field)?.category ||
-                    "system",
-                  operator: QUERY_TO_BASIC_OP[t.operator] || t.operator,
-                  value: Array.isArray(t.value) ? t.value : [t.value],
-                }));
-                setRows(converted);
-                onApply(converted.length > 0 ? converted : null);
-              }}
+              onApply={handleQueryTokensChange}
               initialTokens={rows
                 .filter(
                   (r) =>
@@ -1783,7 +2035,9 @@ const TraceFilterPanel = ({
                 )
                 .map((r) => ({
                   field: r.field,
-                  operator: BASIC_TO_QUERY_OP[r.operator] || r.operator,
+                  operator:
+                    BASIC_TO_QUERY_OP[normalizeFilterRowOperator(r).operator] ||
+                    normalizeFilterRowOperator(r).operator,
                   value: Array.isArray(r.value)
                     ? r.value.join(", ")
                     : r.value || "",
@@ -1792,6 +2046,28 @@ const TraceFilterPanel = ({
               valueLoading={queryValuesLoading}
               onFieldChange={setQueryField}
             />
+            <Stack
+              direction="row"
+              justifyContent="flex-end"
+              spacing={1}
+              sx={{ mt: 1 }}
+            >
+              <Button
+                size="small"
+                onClick={handleClear}
+                sx={{ textTransform: "none", fontSize: 12 }}
+              >
+                Clear all
+              </Button>
+              <Button
+                size="small"
+                variant="contained"
+                onClick={handleApply}
+                sx={{ textTransform: "none", fontSize: 12, px: 2 }}
+              >
+                Apply
+              </Button>
+            </Stack>
             <Typography
               sx={{ fontSize: 11, color: "text.disabled", mt: 1, px: 0.5 }}
             >
@@ -1823,6 +2099,7 @@ TraceFilterPanel.propTypes = {
   panelWidth: PropTypes.number,
   defaultRow: PropTypes.object,
   isSimulator: PropTypes.bool,
+  freeSoloValues: PropTypes.oneOfType([PropTypes.bool, PropTypes.func]),
   isSpansView: PropTypes.bool,
 };
 

@@ -116,6 +116,16 @@ class TestVoiceCallAnnotationNumberFilters:
         )
         assert result != Q()
 
+    def test_not_equal_to_alias_requires_existing_score(self):
+        uid = str(uuid.uuid4())
+        filters = [_make_annotation_filter(uid, "number", "not_equal_to", 4.0)]
+        result, _ = FilterEngine.get_filter_conditions_for_voice_call_annotations(
+            filters
+        )
+
+        assert result != Q()
+        assert f"('annotation_{uid}__score__isnull', False)" in repr(result)
+
     def test_greater_than_or_equal(self):
         uid = str(uuid.uuid4())
         filters = [_make_annotation_filter(uid, "number", "greater_than_or_equal", 3.0)]
@@ -140,13 +150,23 @@ class TestVoiceCallAnnotationNumberFilters:
         )
         assert result != Q()
 
-    def test_not_in_between(self):
+    def test_not_between(self):
         uid = str(uuid.uuid4())
-        filters = [_make_annotation_filter(uid, "number", "not_in_between", [2.0, 8.0])]
+        filters = [_make_annotation_filter(uid, "number", "not_between", [2.0, 8.0])]
         result, _ = FilterEngine.get_filter_conditions_for_voice_call_annotations(
             filters
         )
         assert result != Q()
+
+    def test_not_between_alias_requires_existing_score(self):
+        uid = str(uuid.uuid4())
+        filters = [_make_annotation_filter(uid, "number", "not_between", [2.0, 8.0])]
+        result, _ = FilterEngine.get_filter_conditions_for_voice_call_annotations(
+            filters
+        )
+
+        assert result != Q()
+        assert f"('annotation_{uid}__score__isnull', False)" in repr(result)
 
     def test_invalid_filter_value_is_skipped(self):
         uid = str(uuid.uuid4())
@@ -209,11 +229,11 @@ class TestVoiceCallAnnotationSubFieldNumberFilters:
         )
         assert result != Q()
 
-    def test_sub_field_not_in_between(self):
+    def test_sub_field_not_between(self):
         uid = str(uuid.uuid4())
         filters = [
             _make_annotation_filter(
-                f"{uid}**thumbs_up", "number", "not_in_between", [0, 1]
+                f"{uid}**thumbs_up", "number", "not_between", [0, 1]
             )
         ]
         result, _ = FilterEngine.get_filter_conditions_for_voice_call_annotations(
@@ -371,6 +391,21 @@ class TestVoiceCallAnnotationTextFilters:
         assert result != Q()
         assert extra == {}
 
+    def test_not_contains_requires_existing_text_annotation(self):
+        uid = str(uuid.uuid4())
+        filters = [_make_annotation_filter(uid, "text", "not_contains", "bad")]
+        result, extra = FilterEngine.get_filter_conditions_for_voice_call_annotations(
+            filters
+        )
+
+        exists_count = sum(
+            1
+            for node in result.flatten()
+            if node.__class__.__name__ == "Exists"
+        )
+        assert exists_count >= 2
+        assert extra == {}
+
     def test_equals(self):
         uid = str(uuid.uuid4())
         filters = [_make_annotation_filter(uid, "text", "equals", "exact match")]
@@ -387,6 +422,21 @@ class TestVoiceCallAnnotationTextFilters:
             filters
         )
         assert result != Q()
+        assert extra == {}
+
+    def test_not_equals_requires_existing_text_annotation(self):
+        uid = str(uuid.uuid4())
+        filters = [_make_annotation_filter(uid, "text", "not_equals", "bad value")]
+        result, extra = FilterEngine.get_filter_conditions_for_voice_call_annotations(
+            filters
+        )
+
+        exists_count = sum(
+            1
+            for node in result.flatten()
+            if node.__class__.__name__ == "Exists"
+        )
+        assert exists_count >= 2
         assert extra == {}
 
     def test_starts_with(self):

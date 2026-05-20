@@ -1098,18 +1098,26 @@ def _get_trace_totals_batch(trace_ids: List[str]) -> dict:
 
 
 def _get_trace_score(trace_id: str) -> Optional[float]:
-    """Avg eval score for a trace. Bool-typed evals contribute as 0/1."""
-    return EvalLogger.objects.filter(trace_id=trace_id).aggregate(
-        avg=Avg(EVAL_SCORE_EXPR)
-    )["avg"]
+    """Average EvalLogger score across span-level evals on the trace.
+
+    PR3: target_type='span' keeps this average comparable to its pre-row_type
+    behaviour. Trace-level evals (PR4) are a different semantic unit (one
+    per trace, not per span); their score should surface separately.
+
+    Bool-typed evals contribute via EVAL_SCORE_EXPR (0/1) — sim/voice
+    clusters need this or output_bool-only evals silently score 0.
+    """
+    return EvalLogger.objects.filter(
+        trace_id=trace_id, target_type="span"
+    ).aggregate(avg=Avg(EVAL_SCORE_EXPR))["avg"]
 
 
 def _get_trace_scores_batch(trace_ids: List[str]) -> dict:
-    """Return {trace_id_str: avg eval score} — bool evals counted as 0/1."""
+    """Return {trace_id_str: avg eval score} — span-level evals; bool counted as 0/1."""
     if not trace_ids:
         return {}
     rows = (
-        EvalLogger.objects.filter(trace_id__in=trace_ids)
+        EvalLogger.objects.filter(trace_id__in=trace_ids, target_type="span")
         .values("trace_id")
         .annotate(avg=Avg(EVAL_SCORE_EXPR))
         .filter(avg__isnull=False)
@@ -1444,9 +1452,9 @@ def _fetch_traces_aggregates(cluster_id: str) -> TracesAggregates:
     failing = sum(1 for v in has_issues_map.values() if v)
     passing = sum(1 for v in has_issues_map.values() if not v)
 
-    # Avg eval score across all trace-level EvalLogger rows. Use the
-    # bool-aware helper so sim/voice eval clusters don't show 0.00 when
-    # only output_bool is populated.
+    # PR3: span-only via _avg_eval_score — keeps the avg comparable to
+    # pre-row_type semantics. Trace-level evals (PR4) surface elsewhere.
+    # Helper uses EVAL_SCORE_EXPR for bool-aware avg (sim/voice clusters).
     avg_score = _avg_eval_score(trace_ids) or 0.0
 
     # Latency percentiles: sum(latency_ms) per trace
@@ -1587,17 +1595,17 @@ def _users_affected_in_window(trace_ids: List[str]) -> int:
 
 
 def _avg_eval_score(trace_ids: List[str]) -> Optional[float]:
-    """Average eval score over a list of traces.
+    """Average eval score over span-level evals on a list of traces.
 
-    Uses ``output_float`` when set, falls back to ``output_bool`` cast to 1/0.
-    Bool-only eval clusters (sim/voice projects) need the bool path or this
-    silently returns 0 even though evals ran.
+    PR3: span-only filter. Trace-level evals (PR4) surface elsewhere.
+    Uses EVAL_SCORE_EXPR so bool-only eval clusters (sim/voice) don't
+    silently return 0 when output_bool is the only populated column.
     """
     if not trace_ids:
         return None
-    return EvalLogger.objects.filter(trace_id__in=trace_ids).aggregate(
-        avg=Avg(EVAL_SCORE_EXPR)
-    )["avg"]
+    return EvalLogger.objects.filter(
+        trace_id__in=trace_ids, target_type="span"
+    ).aggregate(avg=Avg(EVAL_SCORE_EXPR))["avg"]
 
 
 def _project_scope_total(
@@ -2144,6 +2152,11 @@ def _recommendation_title_from_category(category: Optional[str]) -> str:
     return parts[-1] if parts else category.strip()
 
 
+# Cap on probable root causes surfaced per cluster — keeps the card
+# readable. See the NOTE in _build_root_causes for the real upstream fix.
+_MAX_ROOT_CAUSES = 4
+
+
 def _build_root_causes(details: List[TraceErrorDetail]) -> List[RootCause]:
     """Flatten ``TraceErrorDetail.root_causes`` across every detail for a
     trace, dedupe, and produce a ranked ``RootCause`` list.
@@ -2153,9 +2166,18 @@ def _build_root_causes(details: List[TraceErrorDetail]) -> List[RootCause]:
     Title = first clause before the first period/comma; description = the
     full string (so the card renders a natural headline + body).
     """
-    seen: set = set()
-    result: List[RootCause] = []
-    rank = 1
+    # NOTE: this is a display-layer mitigation, not the real fix. Two
+    # upstream problems make this list explode and both should be fixed
+    # at the source, not here:
+    #   1. The analysis agent over-generates root causes per trace instead
+    #      of committing to the few that matter — needs a hard cap + ranking
+    #      instruction in the agent prompt.
+    #   2. Dedup below is exact-text only, so the same cause phrased
+    #      slightly differently across traces survives as N near-duplicates
+    #      — needs semantic dedup (same gap as cluster fragmentation).
+    # Until those land we frequency-rank (most recurrent cause first) and
+    # cap the list so the card stays readable.
+    counts: dict = {}
     for d in details:
         for raw in d.root_causes or []:
             if not raw:
@@ -2164,21 +2186,27 @@ def _build_root_causes(details: List[TraceErrorDetail]) -> List[RootCause]:
             if not text:
                 continue
             key = text.lower()
-            if key in seen:
-                continue
-            seen.add(key)
+            entry = counts.get(key)
+            if entry is None:
+                counts[key] = {"text": text, "count": 1}
+            else:
+                entry["count"] += 1
 
-            # Headline: first clause before . or ,
-            split_idx = min(
-                (i for i in (text.find("."), text.find(",")) if i > 0),
-                default=-1,
-            )
-            title = text[:split_idx].strip() if split_idx > 0 else text
-            if len(title) > 120:
-                title = title[:117].rstrip() + "..."
+    # Most-recurrent first; stable on first-seen order for ties.
+    ranked = sorted(counts.values(), key=lambda e: -e["count"])
 
-            result.append(RootCause(rank=rank, title=title, description=text))
-            rank += 1
+    result: List[RootCause] = []
+    for rank, entry in enumerate(ranked[:_MAX_ROOT_CAUSES], start=1):
+        text = entry["text"]
+        # Headline: first clause before . or ,
+        split_idx = min(
+            (i for i in (text.find("."), text.find(",")) if i > 0),
+            default=-1,
+        )
+        title = text[:split_idx].strip() if split_idx > 0 else text
+        if len(title) > 120:
+            title = title[:117].rstrip() + "..."
+        result.append(RootCause(rank=rank, title=title, description=text))
     return result
 
 

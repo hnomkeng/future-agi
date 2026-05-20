@@ -4,7 +4,10 @@ import { useParams } from "react-router";
 
 import axios, { endpoints } from "src/utils/axios";
 import { enqueueSnackbar } from "src/components/snackbar";
-import { EvalPickerDrawer } from "src/sections/common/EvalPicker";
+import {
+  EvalPickerDrawer,
+  serializeEvalConfig,
+} from "src/sections/common/EvalPicker";
 import {
   chatEvalColumns,
   voiceEvalColumns,
@@ -16,7 +19,7 @@ import { AGENT_TYPES } from "../agents/constants";
 import { SourceType } from "../scenarios/common";
 
 const TestDetailConfigureEval = () => {
-  const { testId } = useParams();
+  const { testId, executionId } = useParams();
   const queryClient = useQueryClient();
 
   const { configureEval, setConfigureEval } = useTestDetailStoreShallow(
@@ -73,7 +76,12 @@ const TestDetailConfigureEval = () => {
   }, [agentType, sourceType, testData]);
 
   const { mutateAsync: updateEvalAsync } = useMutation({
-    mutationFn: ({ evalConfigId, payload }) =>
+    mutationFn: (
+      {
+        evalConfigId,
+        payload,
+      },
+    ) =>
       axios.post(
         endpoints.runTests.updateSimulateEval(testId, evalConfigId),
         payload,
@@ -85,32 +93,21 @@ const TestDetailConfigureEval = () => {
     refreshGrid?.();
   }, [queryClient, testId, refreshGrid]);
 
-  // Bridge — the new picker returns a camelCase config; the backend expects
-  // snake_case. Config Eval is always an edit flow (the user is reconfiguring
-  // an existing SimulateEvalConfig bound to a grid column), so we always
-  // route through the update endpoint.
   const handleEvalAdded = useCallback(
     async (evalConfig) => {
       if (!testId || !editingEvalItem?.id) return;
-      const payload = {
-        template_id: evalConfig.templateId,
-        name: evalConfig.name,
-        model: evalConfig.model,
-        mapping: evalConfig.mapping || {},
-        config: {
-          ...(evalConfig.config || {}),
-          ...(evalConfig.data_injection
-            ? { run_config: { data_injection: evalConfig.data_injection } }
-            : {}),
-        },
-        error_localizer: evalConfig.error_localizer_enabled || false,
-        filters: {},
-      };
+      const payload = serializeEvalConfig(evalConfig);
       try {
         await updateEvalAsync({
           evalConfigId: editingEvalItem.id,
-          payload,
+          payload: {
+            ...payload,
+            ...(executionId
+              ? { run: true, test_execution_id: executionId }
+              : {}),
+          },
         });
+
         enqueueSnackbar("Eval updated successfully", { variant: "success" });
         handleRefresh();
       } catch (error) {
@@ -120,7 +117,7 @@ const TestDetailConfigureEval = () => {
         throw error;
       }
     },
-    [testId, editingEvalItem, updateEvalAsync, handleRefresh],
+    [testId, executionId, editingEvalItem, updateEvalAsync, handleRefresh],
   );
 
   const onClose = useCallback(() => {

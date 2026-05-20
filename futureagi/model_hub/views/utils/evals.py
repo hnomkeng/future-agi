@@ -290,11 +290,16 @@ def run_eval_func(
             template.config.get("ground_truth") if template.config else None
         )
         if gt_config_in_template and gt_config_in_template.get("enabled"):
-            from model_hub.utils.ground_truth_retrieval import load_ground_truth_config
+            from model_hub.utils.ground_truth_retrieval import (
+                format_few_shot_examples,
+                get_ground_truth_few_shot_examples,
+                load_ground_truth_config,
+            )
 
             gt_config = load_ground_truth_config(template)
             if gt_config:
                 # Enrich with embedding_status from the GT model
+                gt_obj = None
                 try:
                     from model_hub.models.evals_metric import EvalGroundTruth
 
@@ -305,7 +310,25 @@ def run_eval_func(
                         gt_config["embedding_status"] = gt_obj.embedding_status
                 except Exception:
                     pass
-                _run_kwargs["ground_truth_config"] = gt_config
+
+                if (
+                    eval_id == "CustomPromptEvaluator"
+                    and gt_obj
+                    and gt_obj.embedding_status == "completed"
+                ):
+                    gt_examples = get_ground_truth_few_shot_examples(
+                        gt_config, _run_kwargs
+                    )
+                    if gt_examples:
+                        injection_format = gt_config.get(
+                            "injection_format", "structured"
+                        )
+                        formatted = format_few_shot_examples(
+                            gt_examples, gt_obj.role_mapping, injection_format
+                        )
+                        _run_kwargs["ground_truth_few_shot"] = formatted
+                else:
+                    _run_kwargs["ground_truth_config"] = gt_config
 
         # Preprocess inputs for code evals that need external data (e.g. CLIP embeddings)
         if _is_code_eval:
@@ -358,7 +381,9 @@ def run_eval_func(
         api_call_log_row.input_token_count = (
             metadata.get("usage", {}).get("prompt_tokens") or 0 if metadata else 0
         )
-        api_call_log_row.config = json.dumps(config_dict)
+        # default=str so trace/span values mapped into inputs (Decimal from
+        # clickhouse-driver, datetime, UUID) don't blow up the usage logger.
+        api_call_log_row.config = json.dumps(config_dict, default=str)
         api_call_log_row.status = APICallStatusChoices.SUCCESS.value
         api_call_log_row.save()
 
@@ -434,19 +459,21 @@ def run_eval_func(
 
         if error_localizer:
             from model_hub.tasks.user_evaluation import (
+                _eval_passed,
                 trigger_error_localization_for_playground,
             )
 
-            logger.info(
-                f"sending to error localizer: {api_call_log_row.log_id}, {value}, {param_values}, {response.get('reason')}"
-            )
-            trigger_error_localization_for_playground(
-                eval_template=template,
-                log=api_call_log_row,
-                value=value,
-                mapping=mappings,
-                eval_explanation=response.get("reason"),
-            )
+            if not _eval_passed(value):
+                logger.info(
+                    f"sending to error localizer: {api_call_log_row.log_id}, {value}, {param_values}, {response.get('reason')}"
+                )
+                trigger_error_localization_for_playground(
+                    eval_template=template,
+                    log=api_call_log_row,
+                    value=value,
+                    mapping=mappings,
+                    eval_explanation=response.get("reason"),
+                )
 
         return output
 
@@ -462,7 +489,7 @@ def run_eval_func(
                         "required_keys": list(mappings.keys()),
                     }
                 )
-                api_call_log_row.config = json.dumps(current_config)
+                api_call_log_row.config = json.dumps(current_config, default=str)
                 api_call_log_row.save()
         except Exception as exc:
             logger.exception(f"Error updating api call log row status: {str(exc)}")
@@ -572,7 +599,7 @@ def process_eval_for_single_row(
             data_type = col_map.get(str(base_col_id)) if base_col_id else None
             input_types[key] = data_type if data_type in ["image", "audio"] else "text"
         config_dict.update({"input_data_types": input_types})
-        api_call_log_row.config = json.dumps(config_dict)
+        api_call_log_row.config = json.dumps(config_dict, default=str)
         api_call_log_row.status = APICallStatusChoices.SUCCESS.value
         api_call_log_row.save()
 
@@ -597,7 +624,7 @@ def process_eval_for_single_row(
             api_call_log_row.status = APICallStatusChoices.ERROR.value
             current_config = json.loads(api_call_log_row.config)
             current_config.update({"output": {"output": None, "reason": str(e)}})
-            api_call_log_row.config = json.dumps(current_config)
+            api_call_log_row.config = json.dumps(current_config, default=str)
             api_call_log_row.save()
         except Exception:
             pass

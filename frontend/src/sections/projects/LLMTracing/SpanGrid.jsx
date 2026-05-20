@@ -29,6 +29,7 @@ import CustomTraceHeaderRenderer from "./Renderers/CustomTraceHeaderRenderer";
 import { Events, trackEvent } from "src/utils/Mixpanel";
 import { statusBar } from "src/components/run-insights/traces-tab/common";
 import { objectCamelToSnake } from "src/utils/utils";
+import { canonicalizeApiFilterColumnIds } from "src/utils/filter-column-ids";
 import LLMTracingSpanDetailDrawer from "./LLMTracingSpanDetailDrawer";
 import { useLLMTracingStoreShallow, useSpanGridStore } from "./states";
 import { userTraceRowHeightMapping } from "../UsersView/common";
@@ -348,14 +349,16 @@ const SpanGrid = React.forwardRef(
                 ...(observeId ? { project_id: observeId } : {}),
                 page_number: page,
                 page_size: ROWS_LIMIT,
-                filters: JSON.stringify([
-                  ...objectCamelToSnake([
-                    ...filters,
-                    ...(hasEvalFilter ? [FILTER_FOR_HAS_EVAL] : []),
+                filters: JSON.stringify(
+                  canonicalizeApiFilterColumnIds([
+                    ...objectCamelToSnake([
+                      ...filters,
+                      ...(hasEvalFilter ? [FILTER_FOR_HAS_EVAL] : []),
+                    ]),
+                    ...(extraFilters || EMPTY_EXTRA_FILTERS),
+                    ...(metricFilters || []),
                   ]),
-                  ...(extraFilters || EMPTY_EXTRA_FILTERS),
-                  ...(metricFilters || []),
-                ]),
+                ),
               });
 
               // Use prefetched data if available, otherwise fetch
@@ -377,21 +380,44 @@ const SpanGrid = React.forwardRef(
                 const currentNonCustom = (columnsRef.current || []).filter(
                   (c) => c.groupBy !== "Custom Columns",
                 );
-                if (!_.isEqual(newCols, currentNonCustom)) {
-                  const existingCustom = (columnsRef.current || []).filter(
-                    (c) => c.groupBy === "Custom Columns",
-                  );
-                  const pending = pendingCustomColumnsRef?.current || [];
-                  const existingIds = new Set(existingCustom.map((c) => c.id));
-                  const dedupedPending = pending.filter(
-                    (c) => !existingIds.has(c.id),
-                  );
+                const existingCustom = (columnsRef.current || []).filter(
+                  (c) => c.groupBy === "Custom Columns",
+                );
+                const pending = pendingCustomColumnsRef?.current || [];
+                const existingIds = new Set(existingCustom.map((c) => c.id));
+                const dedupedPending = pending.filter(
+                  (c) => !existingIds.has(c.id),
+                );
+                // Strip isVisible from the diff so saved-view hide maps
+                // don't keep retriggering the merge on every fetch.
+                const stripVis = (cols) =>
+                  (cols || []).map(({ isVisible, ...rest }) => rest);
+                const backendChanged = !_.isEqual(
+                  stripVis(newCols),
+                  stripVis(currentNonCustom),
+                );
+                const hasPending = dedupedPending.length > 0;
+                if (backendChanged || hasPending) {
                   const allCustom = [...existingCustom, ...dedupedPending];
                   if (pending.length > 0 && pendingCustomColumnsRef) {
                     pendingCustomColumnsRef.current = [];
                   }
+                  // Preserve existing isVisible so saved-view hide intent
+                  // survives backend col changes.
+                  const finalNonCustom = backendChanged
+                    ? newCols.map((nc) => {
+                        const existing = currentNonCustom.find(
+                          (c) => c.id === nc.id,
+                        );
+                        return existing
+                          ? { ...nc, isVisible: existing.isVisible }
+                          : nc;
+                      })
+                    : currentNonCustom;
                   setColumns(
-                    allCustom.length > 0 ? [...newCols, ...allCustom] : newCols,
+                    allCustom.length > 0
+                      ? [...finalNonCustom, ...allCustom]
+                      : finalNonCustom,
                   );
                 }
               }

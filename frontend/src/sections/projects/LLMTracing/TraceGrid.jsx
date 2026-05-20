@@ -27,6 +27,7 @@ import { useUrlState } from "src/routes/hooks/use-url-state";
 import { userTraceRowHeightMapping } from "../UsersView/common";
 import { statusBar } from "src/components/run-insights/traces-tab/common";
 import { objectCamelToSnake } from "src/utils/utils";
+import { canonicalizeApiFilterColumnIds } from "src/utils/filter-column-ids";
 import LLMTracingTraceDetailDrawer from "./LLMTracingTraceDetailDrawer";
 import { useLLMTracingStoreShallow, useTraceGridStore } from "./states";
 import _ from "lodash";
@@ -186,14 +187,16 @@ const TraceGrid = React.forwardRef(
                 ...(projectId ? { project_id: projectId } : {}),
                 page_number: page,
                 page_size: ROWS_LIMIT,
-                filters: JSON.stringify([
-                  ...objectCamelToSnake([
-                    ...filters,
-                    ...(hasEvalFilter ? [FILTER_FOR_HAS_EVAL] : []),
+                filters: JSON.stringify(
+                  canonicalizeApiFilterColumnIds([
+                    ...objectCamelToSnake([
+                      ...filters,
+                      ...(hasEvalFilter ? [FILTER_FOR_HAS_EVAL] : []),
+                    ]),
+                    ...(extraFilters || EMPTY_EXTRA_FILTERS),
+                    ...(metricFilters || []),
                   ]),
-                  ...(extraFilters || EMPTY_EXTRA_FILTERS),
-                  ...(metricFilters || []),
-                ]),
+                ),
                 ...(dateInterval && { interval: dateInterval }),
               });
 
@@ -216,23 +219,47 @@ const TraceGrid = React.forwardRef(
                 const currentNonCustom = (columnsRef.current || []).filter(
                   (c) => c.groupBy !== "Custom Columns",
                 );
-                if (!_.isEqual(newCols, currentNonCustom)) {
-                  // Merge: existing custom cols + pending (from localStorage/saved view)
-                  const existingCustom = (columnsRef.current || []).filter(
-                    (c) => c.groupBy === "Custom Columns",
-                  );
-                  const pending = pendingCustomColumnsRef?.current || [];
-                  const existingIds = new Set(existingCustom.map((c) => c.id));
-                  const dedupedPending = pending.filter(
-                    (c) => !existingIds.has(c.id),
-                  );
+                const existingCustom = (columnsRef.current || []).filter(
+                  (c) => c.groupBy === "Custom Columns",
+                );
+                const pending = pendingCustomColumnsRef?.current || [];
+                const existingIds = new Set(existingCustom.map((c) => c.id));
+                const dedupedPending = pending.filter(
+                  (c) => !existingIds.has(c.id),
+                );
+                // Strip isVisible from the diff so saved-view hide maps
+                // don't keep retriggering the merge on every fetch. The
+                // hasPending clause ensures a saved-view switch with same
+                // backend cols still drains the pending customs.
+                const stripVis = (cols) =>
+                  (cols || []).map(({ isVisible, ...rest }) => rest);
+                const backendChanged = !_.isEqual(
+                  stripVis(newCols),
+                  stripVis(currentNonCustom),
+                );
+                const hasPending = dedupedPending.length > 0;
+                if (backendChanged || hasPending) {
                   const allCustom = [...existingCustom, ...dedupedPending];
-                  // Clear pending after consuming
                   if (pending.length > 0 && pendingCustomColumnsRef) {
                     pendingCustomColumnsRef.current = [];
                   }
+                  // Preserve existing isVisible so saved-view hide intent
+                  // survives backend col changes. Pending-only path reuses
+                  // currentNonCustom to keep column identity stable.
+                  const finalNonCustom = backendChanged
+                    ? newCols.map((nc) => {
+                        const existing = currentNonCustom.find(
+                          (c) => c.id === nc.id,
+                        );
+                        return existing
+                          ? { ...nc, isVisible: existing.isVisible }
+                          : nc;
+                      })
+                    : currentNonCustom;
                   setColumns(
-                    allCustom.length > 0 ? [...newCols, ...allCustom] : newCols,
+                    allCustom.length > 0
+                      ? [...finalNonCustom, ...allCustom]
+                      : finalNonCustom,
                   );
                 }
               }

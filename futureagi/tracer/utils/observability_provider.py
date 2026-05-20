@@ -1,9 +1,9 @@
+import json
 import uuid
 from datetime import datetime
 
 import structlog
 from django.db import transaction
-from django.db.models import Q
 from requests.exceptions import HTTPError
 
 from accounts.models.organization import Organization
@@ -16,6 +16,9 @@ from tracer.models.observation_span import ObservationSpan
 from tracer.models.project import ProjectSourceChoices
 from tracer.models.trace import Trace
 from tracer.serializers.observability_provider import ObservabilityProviderSerializer
+from tracer.services.clickhouse.span_attribute_lookups import (
+    span_id_by_provider_log_id,
+)
 from tracer.services.observability_providers import ObservabilityService
 from tracer.tasks.recordings_rehost import (
     RECORDING_KEYS_BY_PROVIDER,
@@ -24,6 +27,7 @@ from tracer.tasks.recordings_rehost import (
 from tracer.utils.eleven_labs import normalize_eleven_labs_data
 from tracer.utils.otel import ResourceLimitError, get_or_create_project
 from tracer.utils.retell import normalize_retell_data
+from tracer.utils.usage_emit import emit_span_ingestion_usage
 from tracer.utils.vapi import normalize_vapi_data
 
 
@@ -285,6 +289,9 @@ def process_and_store_logs(logs: list, provider: ObservabilityProvider):
 
     normalize_fn = normalization_functions[provider.provider]
 
+    created_count = 0
+    created_payload_bytes = 0
+
     for log in logs:
         normalized_data = normalize_fn(log)
         provider_log_id = normalized_data.get("id")
@@ -300,24 +307,46 @@ def process_and_store_logs(logs: list, provider: ObservabilityProvider):
 
         try:
             with transaction.atomic():
-                existing_span = (
-                    ObservationSpan.objects.filter(
-                        Q(metadata__provider_log_id=provider_log_id)
-                        | Q(span_attributes__raw_log__id=provider_log_id)
-                        | Q(eval_attributes__raw_log__id=provider_log_id),
+                # The PG path used to OR three JSONB containment checks
+                # (``metadata__provider_log_id``, ``span_attributes__raw_log__id``,
+                # ``eval_attributes__raw_log__id``). The two GIN indexes that
+                # made the latter two cheap were dropped (migration 0074).
+                # Resolve the candidate span_id via ClickHouse and then fetch
+                # the row from PG by primary key.
+                existing_span_id = span_id_by_provider_log_id(
+                    project_id=str(project.id),
+                    provider=provider.provider,
+                    provider_log_id=provider_log_id,
+                )
+                existing_span = None
+                if existing_span_id:
+                    existing_span = ObservationSpan.objects.filter(
+                        id=existing_span_id,
                         project=project,
                         provider=provider.provider,
+                    ).first()
+
+                # Fallback to the small/cheap PG-side metadata GIN lookup if
+                # CH is unavailable or hasn't indexed this span yet.
+                if existing_span is None:
+                    existing_span = (
+                        ObservationSpan.objects.filter(
+                            metadata__provider_log_id=provider_log_id,
+                            project=project,
+                            provider=provider.provider,
+                        )
+                        .order_by("-updated_at")
+                        .first()
                     )
-                    .order_by("-updated_at")
-                    .first()
-                )
 
                 if existing_span:
                     span = _update_observation_span(existing_span, normalized_data)
+                    was_created = False
                 else:
                     span = _create_observation_span(
                         project, provider, normalized_data, metadata
                     )
+                    was_created = True
 
                 _maybe_enqueue_recording_rehost(provider, span)
         except Exception as e:
@@ -325,6 +354,30 @@ def process_and_store_logs(logs: list, provider: ObservabilityProvider):
                 f"Error updating or creating observation span for {provider.provider}: {e}"
             )
             continue
+
+        if was_created:
+            created_count += 1
+            for piece in (
+                normalized_data.get("input"),
+                normalized_data.get("output"),
+                normalized_data.get("span_attributes"),
+                metadata,
+            ):
+                if piece is None:
+                    continue
+                try:
+                    created_payload_bytes += len(json.dumps(piece, default=str))
+                except (TypeError, ValueError):
+                    continue
+
+    if created_count:
+        emit_span_ingestion_usage(
+            organization_id=project.organization_id,
+            num_traces=created_count,
+            num_spans=created_count,
+            payload_bytes=created_payload_bytes,
+            source="voice_observability",
+        )
 
 
 def _maybe_enqueue_recording_rehost(

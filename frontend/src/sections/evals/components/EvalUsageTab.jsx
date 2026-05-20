@@ -1,6 +1,7 @@
 /* eslint-disable react/prop-types */
 import {
   Box,
+  ButtonBase,
   Chip,
   IconButton,
   Skeleton,
@@ -176,15 +177,22 @@ const useColumns = () =>
         header: "Input",
         meta: { flex: 2 },
         minSize: 200,
-        cell: ({ getValue }) => (
-          <Typography
-            variant="body2"
-            noWrap
-            sx={{ fontSize: "12px", color: "text.secondary" }}
-          >
-            {getValue() || "—"}
-          </Typography>
-        ),
+        cell: ({ getValue }) => {
+          const v = getValue();
+          return (
+            <Typography
+              variant="body2"
+              noWrap
+              sx={{
+                fontSize: "12px",
+                color: v ? "text.secondary" : "text.disabled",
+                fontStyle: v ? "normal" : "italic",
+              }}
+            >
+              {v || "No input"}
+            </Typography>
+          );
+        },
       },
       {
         id: "reason",
@@ -402,7 +410,15 @@ const EvalUsageTab = ({
   }, [detailIndex, filteredLogs.length]);
 
   return (
-    <Box sx={{ display: "flex", height: "100%", minHeight: 0 }}>
+    <Box
+      sx={{
+        display: "flex",
+        height: "100%",
+        minHeight: 0,
+        position: "relative",
+        overflow: "hidden",
+      }}
+    >
       {/* ── Main content ── */}
       <Box
         sx={{
@@ -411,6 +427,7 @@ const EvalUsageTab = ({
           flexDirection: "column",
           minHeight: 0,
           minWidth: 0,
+          marginRight: detailIndex !== null ? "420px" : 0,
           transition: "margin-right 0.25s",
         }}
       >
@@ -589,14 +606,17 @@ const EvalUsageTab = ({
       >
         <Box
           sx={{
+            position: "absolute",
+            top: 0,
+            right: 0,
+            bottom: 0,
             width: 420,
-            flexShrink: 0,
             borderLeft: "1px solid",
             borderColor: "divider",
             display: "flex",
             flexDirection: "column",
-            height: "100%",
             backgroundColor: "background.paper",
+            zIndex: 1,
           }}
         >
           {/* Header with prev/next */}
@@ -746,17 +766,17 @@ const DetailPanelContent = ({
         }}
       >
         {["formatted", "json"].map((m) => (
-          <Box
+          <ButtonBase
             key={m}
             onClick={() => setViewMode(m)}
+            disableRipple
             sx={{
               px: 1.5,
               py: 0.375,
               borderRadius: "5px",
               fontSize: "11px",
-              cursor: "pointer",
               fontWeight: viewMode === m ? 600 : 400,
-              color: viewMode === m ? "text.primary" : "text.disabled",
+              color: viewMode === m ? "text.primary" : "text.secondary",
               backgroundColor:
                 viewMode === m
                   ? (t) =>
@@ -764,10 +784,16 @@ const DetailPanelContent = ({
                         ? "rgba(255,255,255,0.08)"
                         : "action.hover"
                   : "transparent",
+              "&:hover": {
+                backgroundColor: (t) =>
+                  t.palette.mode === "dark"
+                    ? "rgba(255,255,255,0.04)"
+                    : "action.hover",
+              },
             }}
           >
             {m === "formatted" ? "Formatted" : "JSON"}
-          </Box>
+          </ButtonBase>
         ))}
       </Box>
 

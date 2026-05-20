@@ -1,8 +1,22 @@
+import { buildCompositeChildConfigs } from "src/sections/evals/Helpers/compositeRuntimeConfig";
+
 const OUTPUT_TYPE_CONFIG_MAP = {
   pass_fail: "Pass/Fail",
   percentage: "score",
   deterministic: "choices",
 };
+
+const ROW_TYPE_CONTEXT_OPTIONS = {
+  spans: ["span_context"],
+  traces: ["trace_context"],
+  sessions: ["session_context"],
+  voiceCalls: ["call_context"],
+};
+
+export const contextOptionsForRowType = (rowType) =>
+  ROW_TYPE_CONTEXT_OPTIONS[rowType] || null;
+
+export { extractCodeEvaluateParams } from "src/utils/codeEvalParams";
 
 export const hasNonEmptyPromptMessage = (messages = []) =>
   messages.some((message) => {
@@ -95,6 +109,7 @@ export const buildCompositeSourceModeProps = ({
     isComposite: true,
     compositeAdhocConfig: {
       child_template_ids: children.map((child) => child.child_id),
+      child_configs: buildCompositeChildConfigs(children),
       aggregation_enabled:
         compositeDetail?.aggregation_enabled ?? fullEval?.aggregation_enabled ?? true,
       aggregation_function:

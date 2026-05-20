@@ -72,6 +72,132 @@ class TestClickHouseSchema:
         # spans_mv must appear before span_metrics_hourly
         assert names.index("spans_mv") < names.index("span_metrics_hourly")
 
+    def test_eval_logger_ddl_has_target_type_and_trace_session_columns(self):
+        """PR3: tracer_eval_logger DDL must carry the new row_type-stack columns.
+
+        Asserts (a) ``trace_session_id`` is present and Nullable, (b)
+        ``target_type`` is present with default 'span', (c) ``trace_id`` and
+        ``observation_span_id`` are Nullable, (d) the eval_metrics_hourly MV
+        resolves project_id correctly for session rows so all target types
+        contribute to the rollup.
+        """
+        from tracer.services.clickhouse.schema import (
+            CDC_EVAL_LOGGER,
+            EVAL_METRICS_HOURLY_MV,
+            TRACE_SESSION_DICT,
+        )
+
+        # New columns
+        assert "trace_session_id Nullable(UUID)" in CDC_EVAL_LOGGER
+        assert "target_type LowCardinality(String) DEFAULT 'span'" in CDC_EVAL_LOGGER
+
+        # Existing FK columns must be Nullable for session rows to land
+        assert "trace_id Nullable(UUID)" in CDC_EVAL_LOGGER
+        assert "observation_span_id Nullable(String)" in CDC_EVAL_LOGGER
+
+        # Bloom filter index on the new discriminator + session FK
+        assert "idx_target_type target_type" in CDC_EVAL_LOGGER
+        assert "idx_trace_session_id trace_session_id" in CDC_EVAL_LOGGER
+
+        # Allow nullable key for trace_id in ORDER BY
+        assert "allow_nullable_key = 1" in CDC_EVAL_LOGGER
+
+        # New TRACE_SESSION_DICT exists and points at the trace_session table
+        assert (
+            "CREATE DICTIONARY IF NOT EXISTS trace_session_dict" in TRACE_SESSION_DICT
+        )
+        assert "trace_session" in TRACE_SESSION_DICT
+        assert "project_id UUID" in TRACE_SESSION_DICT
+
+        # MV INCLUDES sessions: no target_type filter; project_id resolved
+        # via trace_session_dict for session rows, trace_dict for span/trace
+        assert "target_type IN" not in EVAL_METRICS_HOURLY_MV, (
+            "EVAL_METRICS_HOURLY_MV should NOT filter by target_type — sessions "
+            "must contribute to the rollup. See PR3."
+        )
+        assert "trace_session_dict" in EVAL_METRICS_HOURLY_MV
+        assert "trace_dict" in EVAL_METRICS_HOURLY_MV
+        # The branching expression must be present
+        assert (
+            "if(" in EVAL_METRICS_HOURLY_MV
+            and "target_type = 'session'" in EVAL_METRICS_HOURLY_MV
+        ), "MV must branch project_id resolution on target_type='session'"
+
+    def test_post_ddl_alters_evolves_existing_eval_logger_tables(self):
+        """ALTER statements bring already-created tracer_eval_logger tables forward."""
+        from tracer.services.clickhouse.schema import POST_DDL_ALTERS
+
+        joined = "\n".join(POST_DDL_ALTERS)
+        assert "tracer_eval_logger ADD COLUMN IF NOT EXISTS trace_session_id" in joined
+        assert "tracer_eval_logger ADD COLUMN IF NOT EXISTS target_type" in joined
+        assert "tracer_eval_logger MODIFY COLUMN trace_id Nullable(UUID)" in joined
+        # The MODIFY trace_id must be sandwiched between DROP INDEX and ADD
+        # INDEX for idx_trace_id (CH refuses to alter a column that's part
+        # of a skip index — Code: 524).
+        drop_idx = joined.index("DROP INDEX IF EXISTS idx_trace_id")
+        modify = joined.index("MODIFY COLUMN trace_id Nullable(UUID)")
+        readd_idx = joined.index("ADD INDEX IF NOT EXISTS idx_trace_id ")
+        assert drop_idx < modify < readd_idx, (
+            "POST_DDL_ALTERS must order DROP INDEX → MODIFY COLUMN → ADD INDEX "
+            "for idx_trace_id; ClickHouse refuses to alter an indexed column."
+        )
+
+    def test_mv_recreate_manifest_consistency(self):
+        """Every MV_RECREATE_MANIFEST entry must resolve to a real DDL constant."""
+        from tracer.services.clickhouse import schema as ch_schema
+
+        for mv_name, manifest in ch_schema.MV_RECREATE_MANIFEST.items():
+            const_name = manifest["ddl_constant_name"]
+            ddl = getattr(ch_schema, const_name, None)
+            assert isinstance(ddl, str) and ddl.strip(), (
+                f"Manifest entry for '{mv_name}' references "
+                f"non-existent or empty DDL constant '{const_name}'"
+            )
+            # The MV must reference its declared source and target tables.
+            assert manifest["source_table"] in ddl, (
+                f"DDL for '{mv_name}' does not reference source_table "
+                f"{manifest['source_table']!r}"
+            )
+            assert manifest["target_table"] in ddl, (
+                f"DDL for '{mv_name}' does not reference target_table "
+                f"{manifest['target_table']!r}"
+            )
+
+    def test_mv_recreate_manifest_backfill_mirrors_mv_filter(self):
+        """The backfill_select must produce the same row set as the MV.
+
+        Both the MV body and the manifest's backfill query include all
+        target types (span/trace/session) and resolve project_id via the
+        same target_type-branching expression. Drift between the two
+        would cause the backfill to re-aggregate a different population
+        than the MV processes on live writes.
+        """
+        from tracer.services.clickhouse.schema import (
+            EVAL_METRICS_HOURLY_MV,
+            MV_RECREATE_MANIFEST,
+        )
+
+        manifest = MV_RECREATE_MANIFEST["eval_metrics_hourly_mv"]
+        backfill = manifest["backfill_select"]
+
+        # Neither the MV nor the backfill filters by target_type — sessions
+        # are deliberately included in the rollup. Pin this so a future
+        # "fix" doesn't accidentally re-introduce the filter.
+        assert "target_type IN" not in EVAL_METRICS_HOURLY_MV
+        assert "target_type IN" not in backfill
+
+        # Both branch project_id resolution on session vs span/trace
+        for body in (EVAL_METRICS_HOURLY_MV, backfill):
+            assert "target_type = 'session'" in body
+            assert "trace_session_dict" in body
+            assert "trace_dict" in body
+
+        # Backfill carries the cutoff parameter
+        assert "%(cutoff)s" in backfill
+        # Backfill GROUP BY must match — the recreate command's chunk-injection
+        # logic relies on the GROUP BY marker being present.
+        assert "GROUP BY" in backfill
+
     def test_get_drop_statements(self):
         """Drop statements should be generated in reverse dependency order."""
         from tracer.services.clickhouse.schema import get_drop_statements
@@ -205,6 +331,96 @@ class TestClickHouseFilterBuilder:
         assert where == ""
         assert params == {}
 
+    def test_translate_global_annotator_multi_value_filter(self):
+        """Multiple annotators should match the union of traces they annotated."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        user_ids = [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ]
+        builder = ClickHouseFilterBuilder()
+        where, params = builder.translate(
+            [
+                {
+                    "column_id": "annotator",
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "in",
+                        "filter_value": user_ids,
+                        "col_type": "SYSTEM_METRIC",
+                    },
+                }
+            ]
+        )
+
+        assert "trace_id IN" in where
+        assert "model_hub_score AS s FINAL" in where
+        assert "s.annotator_id IN" in where
+        assert "toUUID(%(uid_1)s), toUUID(%(uid_2)s)" in where
+        assert params == {"uid_1": user_ids[0], "uid_2": user_ids[1]}
+
+    def test_span_mode_global_annotator_filter_targets_span_id(self):
+        """The spans tab annotator filter should not widen to whole traces."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        user_id = "11111111-1111-1111-1111-111111111111"
+        builder = ClickHouseFilterBuilder(
+            query_mode=ClickHouseFilterBuilder.QUERY_MODE_SPAN
+        )
+        where, params = builder.translate(
+            [
+                {
+                    "column_id": "annotator",
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": user_id,
+                        "col_type": "SYSTEM_METRIC",
+                    },
+                }
+            ]
+        )
+
+        assert where.strip().startswith("id IN")
+        assert "trace_id IN" not in where
+        assert "s.annotator_id = toUUID(%(uid_1)s)" in where
+        assert "LEFT JOIN spans AS root_sp" in where
+        assert params == {"uid_1": user_id}
+
+    def test_span_mode_my_annotations_filter_targets_span_id(self):
+        """my_annotations uses span ids in span mode and trace ids elsewhere."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        user_id = "11111111-1111-1111-1111-111111111111"
+        builder = ClickHouseFilterBuilder(
+            query_mode=ClickHouseFilterBuilder.QUERY_MODE_SPAN
+        )
+        where, params = builder.translate(
+            [
+                {
+                    "column_id": "my_annotations",
+                    "filter_config": {
+                        "filter_type": "boolean",
+                        "filter_op": "equals",
+                        "filter_value": True,
+                        "user_id": user_id,
+                    },
+                }
+            ]
+        )
+
+        assert where.strip().startswith("id IN")
+        assert "trace_id IN" not in where
+        assert "s.annotator_id = toUUID(%(uid_1)s)" in where
+        assert params == {"uid_1": user_id}
+
     def test_translate_system_metric_equals(self):
         """SYSTEM_METRIC equals filter should map to direct column comparison."""
         from tracer.services.clickhouse.query_builders.filters import (
@@ -251,6 +467,126 @@ class TestClickHouseFilterBuilder:
         assert "latency_ms" in where
         assert ">" in where
 
+    def test_translate_span_name_system_metric_maps_to_name_column(self):
+        """Span list Span Name filter should use spans.name, not an attribute map."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder(
+            query_mode=ClickHouseFilterBuilder.QUERY_MODE_SPAN
+        )
+        filters = [
+            {
+                "column_id": "span_name",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": ["response"],
+                    "col_type": "SYSTEM_METRIC",
+                },
+            }
+        ]
+
+        where, params = builder.translate(filters)
+
+        assert "name IN" in where
+        assert "span_attr_" not in where
+        assert "trace_id IN" not in where
+        assert tuple(params.values()) == (("response",),)
+
+    def test_trace_mode_span_name_filter_can_match_child_spans(self):
+        """Trace-list Span Name should find traces by any child span name."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder(
+            query_mode=ClickHouseFilterBuilder.QUERY_MODE_TRACE
+        )
+        filters = [
+            {
+                "column_id": "span_name",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": ["response"],
+                    "col_type": "SYSTEM_METRIC",
+                },
+            }
+        ]
+
+        where, params = builder.translate(filters)
+
+        assert "trace_id IN" in where
+        assert "name IN" in where
+        assert "span_attr_" not in where
+        assert "parent_span_id" not in where
+        assert tuple(params.values()) == (("response",),)
+
+    def test_trace_mode_legacy_name_filter_remains_root_span_only(self):
+        """Legacy Trace Name alias should not match arbitrary child span names."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder(
+            query_mode=ClickHouseFilterBuilder.QUERY_MODE_TRACE
+        )
+        filters = [
+            {
+                "column_id": "name",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": ["root trace"],
+                    "col_type": "SYSTEM_METRIC",
+                },
+            }
+        ]
+
+        where, params = builder.translate(filters)
+
+        assert "trace_id IN" in where
+        assert "name IN" in where
+        assert "parent_span_id IS NULL OR parent_span_id = ''" in where
+        assert tuple(params.values()) == (("root trace",),)
+
+    @pytest.mark.parametrize(
+        ("frontend_column", "clickhouse_column"),
+        [
+            ("latency", "latency_ms"),
+            ("tokens", "total_tokens"),
+            ("input_tokens", "prompt_tokens"),
+            ("output_tokens", "completion_tokens"),
+        ],
+    )
+    def test_translate_dashboard_system_metric_names(
+        self, frontend_column, clickhouse_column
+    ):
+        """Dashboard metric names should filter on their denormalized CH columns."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder()
+        filters = [
+            {
+                "column_id": frontend_column,
+                "filter_config": {
+                    "filter_type": "number",
+                    "filter_op": "greater_than",
+                    "filter_value": 0,
+                    "col_type": "SYSTEM_METRIC",
+                },
+            }
+        ]
+
+        where, _params = builder.translate(filters)
+
+        assert clickhouse_column in where
+        assert "span_attr_" not in where
+
     def test_translate_span_attribute_string(self):
         """SPAN_ATTRIBUTE text filter should use span_attr_str map column."""
         from tracer.services.clickhouse.query_builders.filters import (
@@ -293,7 +629,7 @@ class TestClickHouseFilterBuilder:
             }
         ]
         where, params = builder.translate(filters)
-        assert "span_attr_num" in where
+        assert "prompt_tokens" in where
         assert ">" in where
 
     def test_translate_span_attribute_boolean(self):
@@ -309,7 +645,7 @@ class TestClickHouseFilterBuilder:
                 "filter_config": {
                     "filter_type": "boolean",
                     "filter_op": "equals",
-                    "filter_value": 1,
+                    "filter_value": True,
                     "col_type": "SPAN_ATTRIBUTE",
                 },
             }
@@ -549,7 +885,303 @@ class TestClickHouseFilterBuilder:
         ]
         where, params = builder.translate(filters)
         assert "trace_id IN" in where
+        assert "00000000-0000-0000-0000-000000000000" in where
+
+    @pytest.mark.django_db
+    def test_translate_score_eval_between_filter_scales_to_raw_storage(
+        self, custom_eval_config
+    ):
+        """SCORE eval filters scale UI percentages to raw CH storage."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        custom_eval_config.eval_template.config = {"output": "score"}
+        custom_eval_config.eval_template.save(update_fields=["config"])
+
+        builder = ClickHouseFilterBuilder(
+            project_ids=[str(custom_eval_config.project_id)]
+        )
+        where, params = builder.translate(
+            [
+                {
+                    "column_id": str(custom_eval_config.id),
+                    "filter_config": {
+                        "filter_type": "number",
+                        "filter_op": "between",
+                        "filter_value": [20, 80],
+                        "col_type": "EVAL_METRIC",
+                    },
+                }
+            ]
+        )
+
         assert "tracer_eval_logger" in where
+        assert "output_float BETWEEN" in where
+        assert 0.2 in params.values()
+        assert 0.8 in params.values()
+
+    @pytest.mark.django_db
+    def test_translate_score_eval_not_between_and_in_filters_scale_values(
+        self, custom_eval_config
+    ):
+        """SCORE eval range and list filters should compare raw 0-1 storage."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        custom_eval_config.eval_template.config = {"output": "score"}
+        custom_eval_config.eval_template.save(update_fields=["config"])
+
+        builder = ClickHouseFilterBuilder(
+            project_ids=[str(custom_eval_config.project_id)]
+        )
+        where, params = builder.translate(
+            [
+                {
+                    "column_id": str(custom_eval_config.id),
+                    "filter_config": {
+                        "filter_type": "number",
+                        "filter_op": "not_between",
+                        "filter_value": [20, 80],
+                        "col_type": "EVAL_METRIC",
+                    },
+                },
+                {
+                    "column_id": str(custom_eval_config.id),
+                    "filter_config": {
+                        "filter_type": "number",
+                        "filter_op": "in",
+                        "filter_value": [10, 90],
+                        "col_type": "EVAL_METRIC",
+                    },
+                },
+            ]
+        )
+
+        assert "output_float NOT BETWEEN" in where
+        assert "output_float IN" in where
+        assert 0.2 in params.values()
+        assert 0.8 in params.values()
+        assert (0.1, 0.9) in params.values()
+
+    @pytest.mark.django_db
+    def test_translate_score_eval_null_filters_use_output_float(
+        self, custom_eval_config
+    ):
+        """SCORE eval null filters should check output_float presence."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        custom_eval_config.eval_template.config = {"output": "score"}
+        custom_eval_config.eval_template.save(update_fields=["config"])
+
+        builder = ClickHouseFilterBuilder(
+            project_ids=[str(custom_eval_config.project_id)]
+        )
+        where, _params = builder.translate(
+            [
+                {
+                    "column_id": str(custom_eval_config.id),
+                    "filter_config": {
+                        "filter_type": "number",
+                        "filter_op": "is_null",
+                        "filter_value": None,
+                        "col_type": "EVAL_METRIC",
+                    },
+                }
+            ]
+        )
+
+        assert "trace_id NOT IN" in where
+        assert "output_float IS NOT NULL" in where
+
+    @pytest.mark.django_db
+    def test_translate_pass_fail_eval_filter_uses_output_bool(self, custom_eval_config):
+        """Pass/fail evals must use output_bool, not stale mixed fields."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        custom_eval_config.eval_template.config = {"output": "Pass/Fail"}
+        custom_eval_config.eval_template.save(update_fields=["config"])
+
+        builder = ClickHouseFilterBuilder(
+            project_ids=[str(custom_eval_config.project_id)]
+        )
+        where, params = builder.translate(
+            [
+                {
+                    "column_id": str(custom_eval_config.id),
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "in",
+                        "filter_value": ["Passed", "Failed"],
+                        "col_type": "EVAL_METRIC",
+                    },
+                }
+            ]
+        )
+
+        assert "output_bool IN" in where
+        assert "output_float" not in where
+        assert (1, 0) in params.values()
+
+    @pytest.mark.django_db
+    def test_translate_pass_fail_eval_negative_and_null_filters(
+        self, custom_eval_config
+    ):
+        """Pass/fail eval negative and null filters should use output_bool."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        custom_eval_config.eval_template.config = {"output": "Pass/Fail"}
+        custom_eval_config.eval_template.save(update_fields=["config"])
+
+        builder = ClickHouseFilterBuilder(
+            project_ids=[str(custom_eval_config.project_id)]
+        )
+        where, params = builder.translate(
+            [
+                {
+                    "column_id": str(custom_eval_config.id),
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "not_in",
+                        "filter_value": ["Passed"],
+                        "col_type": "EVAL_METRIC",
+                    },
+                },
+                {
+                    "column_id": str(custom_eval_config.id),
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "is_not_null",
+                        "filter_value": None,
+                        "col_type": "EVAL_METRIC",
+                    },
+                },
+            ]
+        )
+
+        assert "output_bool NOT IN" in where
+        assert "output_bool IS NOT NULL" in where
+        assert (1,) in params.values()
+
+    @pytest.mark.django_db
+    def test_translate_choice_eval_filter_uses_list_and_scalar_outputs(
+        self, custom_eval_config
+    ):
+        """Choice evals use output_str_list, with output_str as fallback."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        custom_eval_config.eval_template.config = {"output": "choices"}
+        custom_eval_config.eval_template.save(update_fields=["config"])
+
+        builder = ClickHouseFilterBuilder(
+            project_ids=[str(custom_eval_config.project_id)]
+        )
+        where, params = builder.translate(
+            [
+                {
+                    "column_id": str(custom_eval_config.id),
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "in",
+                        "filter_value": ["fear", "joy"],
+                        "col_type": "EVAL_METRIC",
+                    },
+                }
+            ]
+        )
+
+        assert "has(JSONExtract(output_str_list, 'Array(String)')" in where
+        assert "output_str =" in where
+        assert "fear" in params.values()
+        assert "joy" in params.values()
+
+    @pytest.mark.django_db
+    def test_translate_choice_eval_negative_filter_checks_all_selected_values(
+        self, custom_eval_config
+    ):
+        """Negative choice eval filters should negate every selected choice."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        custom_eval_config.eval_template.config = {"output": "choices"}
+        custom_eval_config.eval_template.save(update_fields=["config"])
+
+        builder = ClickHouseFilterBuilder(
+            project_ids=[str(custom_eval_config.project_id)]
+        )
+        where, params = builder.translate(
+            [
+                {
+                    "column_id": str(custom_eval_config.id),
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "not_in",
+                        "filter_value": ["fear", "joy"],
+                        "col_type": "EVAL_METRIC",
+                    },
+                }
+            ]
+        )
+
+        assert "NOT (" in where
+        assert "notEmpty(JSONExtract(output_str_list, 'Array(String)'))" in where
+        assert "has(JSONExtract(output_str_list, 'Array(String)')" in where
+        assert "output_str =" in where
+        assert "fear" in params.values()
+        assert "joy" in params.values()
+
+    @pytest.mark.django_db
+    def test_translate_choice_eval_contains_and_prefix_filters_parse_choice_array(
+        self, custom_eval_config
+    ):
+        """Choice eval substring filters should inspect each parsed list item."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        custom_eval_config.eval_template.config = {"output": "choices"}
+        custom_eval_config.eval_template.save(update_fields=["config"])
+
+        builder = ClickHouseFilterBuilder(
+            project_ids=[str(custom_eval_config.project_id)]
+        )
+        where, params = builder.translate(
+            [
+                {
+                    "column_id": str(custom_eval_config.id),
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "contains",
+                        "filter_value": ["fear"],
+                        "col_type": "EVAL_METRIC",
+                    },
+                },
+                {
+                    "column_id": str(custom_eval_config.id),
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "starts_with",
+                        "filter_value": ["joy"],
+                        "col_type": "EVAL_METRIC",
+                    },
+                },
+            ]
+        )
+
+        assert "arrayExists(x -> x ILIKE" in where
+        assert "JSONExtract(output_str_list, 'Array(String)')" in where
+        assert "%fear%" in params.values()
+        assert "joy%" in params.values()
 
     def test_translate_annotation_filter(self):
         """ANNOTATION filter should produce a subquery against annotation tables."""
@@ -572,6 +1204,93 @@ class TestClickHouseFilterBuilder:
         where, params = builder.translate(filters)
         assert "trace_id IN" in where
         assert "model_hub_score" in where
+
+    def test_translate_annotation_filter_resolves_span_scores_to_trace(self):
+        """Annotation filters should match Score rows stored on spans."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder()
+        filters = [
+            {
+                "column_id": "00000000-0000-0000-0000-000000000044",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "good",
+                    "col_type": "ANNOTATION",
+                },
+            }
+        ]
+
+        where, params = builder.translate(filters)
+
+        assert "model_hub_score AS s FINAL" in where
+        assert "LEFT JOIN spans AS sp" in where
+        assert "sp.id = s.observation_span_id" in where
+        assert "sp.trace_id" in where
+        assert "toString(s.trace_id)" in where
+        assert "JSONExtractString(s.value, 'text')" in where
+        assert params["ann_label_1"] == "00000000-0000-0000-0000-000000000044"
+
+    def test_span_mode_annotation_filter_targets_span_id(self):
+        """Span tab annotation filters must not match every span in a trace."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder(
+            query_mode=ClickHouseFilterBuilder.QUERY_MODE_SPAN
+        )
+        filters = [
+            {
+                "column_id": "00000000-0000-0000-0000-000000000044",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "good",
+                    "col_type": "ANNOTATION",
+                },
+            }
+        ]
+
+        where, params = builder.translate(filters)
+
+        assert where.strip().startswith("id IN")
+        assert "trace_id IN" not in where
+        assert "model_hub_score AS s FINAL" in where
+        assert "s.observation_span_id" in where
+        assert "LEFT JOIN spans AS root_sp" in where
+        assert "root_sp.parent_span_id" in where
+        assert params["ann_label_1"] == "00000000-0000-0000-0000-000000000044"
+
+    def test_span_mode_annotation_text_in_filter_targets_span_id(self):
+        """Observe multi-select text filters should work for span annotations."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder(
+            query_mode=ClickHouseFilterBuilder.QUERY_MODE_SPAN
+        )
+        where, params = builder.translate(
+            [
+                {
+                    "column_id": "00000000-0000-0000-0000-000000000044",
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "in",
+                        "filter_value": ["Good", "Bad"],
+                        "col_type": "ANNOTATION",
+                    },
+                }
+            ]
+        )
+
+        assert where.strip().startswith("id IN")
+        assert "lower(JSONExtractString(s.value, 'text')) IN" in where
+        assert params["ann_2"] == ("good", "bad")
 
     def test_translate_skips_empty_filter_config(self):
         """Filters with missing column_id or config should be skipped."""
@@ -756,8 +1475,44 @@ class TestClickHouseFilterBuilder:
         where, params = builder.translate(filters)
         assert "trace_id IN" in where
         assert "model_hub_score" in where
+        assert "LEFT JOIN spans AS sp" in where
+        assert "sp.id = s.observation_span_id" in where
         assert "_peerdb_is_deleted = 0" in where
         assert params == {}
+
+    def test_span_mode_has_annotation_targets_span_id(self):
+        """has_annotation on the spans tab should filter span ids, not trace ids."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder(
+            query_mode=ClickHouseFilterBuilder.QUERY_MODE_SPAN,
+            annotation_label_ids=[
+                "00000000-0000-0000-0000-000000000011",
+                "00000000-0000-0000-0000-000000000022",
+            ],
+        )
+        filters = [
+            {
+                "column_id": "has_annotation",
+                "filter_config": {
+                    "filter_type": "boolean",
+                    "filter_op": "equals",
+                    "filter_value": True,
+                },
+            }
+        ]
+
+        where, params = builder.translate(filters)
+
+        assert where.strip().startswith("id IN")
+        assert "trace_id IN" not in where
+        assert "GROUP BY entity_id" in where
+        assert "uniq(s.label_id) >= 2" in where
+        assert "root_sp.parent_span_id" in where
+        assert params["lbl_1"] == "00000000-0000-0000-0000-000000000011"
+        assert params["lbl_2"] == "00000000-0000-0000-0000-000000000022"
 
     def test_translate_has_annotation_false(self):
         """has_annotation=false should produce NOT IN subquery (non-annotated traces)."""
@@ -1202,6 +1957,54 @@ class TestSessionListQueryBuilder:
         assert "GROUP BY trace_session_id" in query
         assert "HAVING" in query
 
+    def test_having_filter_normalizes_operator_alias(self):
+        """Session aggregate filters should accept saved UI operator aliases."""
+        from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
+
+        builder = SessionListQueryBuilder(
+            project_id="test-project-id",
+            filters=[
+                {
+                    "column_id": "duration",
+                    "filter_config": {
+                        "filter_op": "equal_to",
+                        "filter_value": 60,
+                    },
+                }
+            ],
+            page_number=0,
+            page_size=10,
+        )
+        query, params = builder.build()
+
+        assert "HAVING" in query
+        assert "duration = %(having_" in query
+        assert 60 in params.values()
+
+    def test_having_filter_unknown_operator_does_not_fall_back_to_equals(self):
+        """Unsupported session aggregate operators should match no rows."""
+        from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
+
+        builder = SessionListQueryBuilder(
+            project_id="test-project-id",
+            filters=[
+                {
+                    "column_id": "duration",
+                    "filter_config": {
+                        "filter_op": "definitely_not_supported",
+                        "filter_value": 60,
+                    },
+                }
+            ],
+            page_number=0,
+            page_size=10,
+        )
+        query, _params = builder.build()
+
+        assert "HAVING" in query
+        assert "0 = 1" in query
+        assert "duration = %(having_" not in query
+
     def test_build_with_user_id(self):
         """When user_id is provided, query should filter by end_user_id."""
         from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
@@ -1587,6 +2390,61 @@ class TestEvalMetricsQueryBuilder:
         query, params = builder.build()
         assert "tracer_eval_logger" in query
         assert "FINAL" in query
+
+    def test_build_with_filters_unpacks_filter_builder_result(self):
+        """Filtered eval graphs should merge the CH filter fragment and params."""
+        from tracer.services.clickhouse.query_builders import EvalMetricsQueryBuilder
+
+        builder = EvalMetricsQueryBuilder(
+            project_id="test-project-id",
+            custom_eval_config_id="00000000-0000-0000-0000-000000000001",
+            interval="hour",
+            eval_output_type="SCORE",
+            use_preaggregated=False,
+            filters=[
+                {
+                    "column_id": "status",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "OK",
+                    },
+                }
+            ],
+        )
+
+        query, params = builder.build()
+        assert "SELECT DISTINCT trace_id FROM spans" in query
+        assert "lower(status) =" in query
+        assert "ok" in params.values()
+
+    def test_build_with_filters_forces_raw_eval_query(self):
+        """Filtered eval graphs cannot use pre-aggregated rows."""
+        from tracer.services.clickhouse.query_builders import EvalMetricsQueryBuilder
+
+        builder = EvalMetricsQueryBuilder(
+            project_id="test-project-id",
+            custom_eval_config_id="00000000-0000-0000-0000-000000000001",
+            interval="hour",
+            eval_output_type="SCORE",
+            filters=[
+                {
+                    "column_id": "status",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "OK",
+                    },
+                }
+            ],
+        )
+
+        query, _params = builder.build()
+        assert "tracer_eval_logger" in query
+        assert "eval_metrics_hourly" not in query
+        assert "SELECT DISTINCT trace_id FROM spans" in query
 
     def test_default_time_range(self):
         """When no start/end dates provided, should default to last 7 days."""
@@ -2409,7 +3267,7 @@ class TestTraceListQueryBuilderComprehensive:
             ],
         )
         query, params = builder.build()
-        assert "span_attr_num" in query
+        assert "prompt_tokens" in query
         assert ">" in query
 
     def test_build_with_eval_metric_filter(self):
@@ -2432,7 +3290,7 @@ class TestTraceListQueryBuilderComprehensive:
         )
         query, params = builder.build()
         assert "trace_id IN" in query
-        assert "tracer_eval_logger" in query
+        assert "00000000-0000-0000-0000-000000000000" in query
 
     def test_build_with_annotation_filter(self):
         """ANNOTATION filter should generate a subquery against annotation table."""
@@ -2495,7 +3353,7 @@ class TestTraceListQueryBuilderComprehensive:
         query, params = builder.build()
         assert "model" in query
         assert "span_attr_str" in query
-        assert "tracer_eval_logger" in query
+        assert "00000000-0000-0000-0000-000000000000" in query
 
     def test_build_with_contains_filter(self):
         """Contains filter should produce LIKE with percent wildcards."""
@@ -2777,6 +3635,9 @@ class TestTraceListQueryBuilderComprehensive:
         )
         assert "model_hub_score" in query
         assert "label_id" in query
+        assert "LEFT JOIN spans AS sp" in query
+        assert "sp.id = s.observation_span_id" in query
+        assert "s.deleted = false" in query
         assert "GROUP BY" in query
         assert params["trace_ids"] == ("t1", "t2")
         assert params["label_ids"] == ("label-1", "label-2")
@@ -3175,6 +4036,36 @@ class TestSpanListQueryBuilderComprehensive:
         query, params = builder.build()
         assert "span_attr_str" in query
 
+    def test_build_with_has_annotation_uses_span_annotation_labels(self):
+        """SpanListQueryBuilder should pass label ids into has_annotation filters."""
+        from tracer.services.clickhouse.query_builders import SpanListQueryBuilder
+
+        builder = SpanListQueryBuilder(
+            project_id="proj-1",
+            annotation_label_ids=[
+                "00000000-0000-0000-0000-000000000011",
+                "00000000-0000-0000-0000-000000000022",
+            ],
+            filters=[
+                {
+                    "column_id": "has_annotation",
+                    "filter_config": {
+                        "filter_type": "boolean",
+                        "filter_op": "equals",
+                        "filter_value": True,
+                    },
+                }
+            ],
+        )
+
+        query, params = builder.build()
+
+        assert "AND id IN" in query
+        assert "GROUP BY entity_id" in query
+        assert "uniq(s.label_id) >= 2" in query
+        assert params["lbl_1"] == "00000000-0000-0000-0000-000000000011"
+        assert params["lbl_2"] == "00000000-0000-0000-0000-000000000022"
+
     def test_build_with_end_user_filter(self):
         """end_user_id should add end_user_id clause."""
         from tracer.services.clickhouse.query_builders import SpanListQueryBuilder
@@ -3367,6 +4258,7 @@ class TestSpanListQueryBuilderComprehensive:
         assert "model_hub_score" in query
         assert "observation_span_id" in query
         assert "label_id" in query
+        assert "deleted = false" in query
         assert "GROUP BY" in query
         assert params["span_ids"] == ("span-1", "span-2")
         assert params["label_ids"] == ("label-1", "label-2")
@@ -3539,7 +4431,7 @@ class TestEvalMetricsQueryBuilderExtended:
         assert "tracer_eval_logger" in query
 
     def test_choices_query_with_choices(self):
-        """Choices query should use countIf(has(...)) for each choice."""
+        """Choices query should parse the JSON-string choice list before has()."""
         from tracer.services.clickhouse.query_builders import EvalMetricsQueryBuilder
 
         builder = EvalMetricsQueryBuilder(
@@ -3550,7 +4442,8 @@ class TestEvalMetricsQueryBuilderExtended:
         )
         query, params = builder.build()
         assert "countIf" in query
-        assert "has(output_str_list" in query
+        assert "has(JSONExtract(output_str_list, 'Array(String)')" in query
+        assert "OR output_str =" in query
         assert "choice_0" in params
         assert "choice_1" in params
         assert "choice_2" in params
@@ -3732,8 +4625,9 @@ class TestFilterBuilderEdgeCases:
             for v in params.values()
         )
 
-    def test_not_in_between_filter(self):
-        """not_in_between should produce NOT BETWEEN clause."""
+    def test_not_between_filter(self):
+        """not_between should produce NOT BETWEEN clause. (Canonical op
+        name; `not_in_between` is the retired legacy alias.)"""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -3744,7 +4638,7 @@ class TestFilterBuilderEdgeCases:
                 "column_id": "cost",
                 "filter_config": {
                     "filter_type": "number",
-                    "filter_op": "not_in_between",
+                    "filter_op": "not_between",
                     "filter_value": [0.1, 1.0],
                     "col_type": "SYSTEM_METRIC",
                 },
@@ -3891,10 +4785,7 @@ class TestFilterBuilderEdgeCases:
         ]
         where, _ = builder.translate(filters)
         assert "trace_id IN (" in where
-        assert "tracer_eval_logger FINAL" in where
-        assert "custom_eval_config_id" in where
-        assert "_peerdb_is_deleted = 0" in where
-        assert "output_float" in where
+        assert "00000000-0000-0000-0000-000000000000" in where
 
     def test_annotation_filter_subquery_structure(self):
         """ANNOTATION filter should have correct subquery structure."""
@@ -3916,10 +4807,263 @@ class TestFilterBuilderEdgeCases:
         ]
         where, _ = builder.translate(filters)
         assert "trace_id IN (" in where
-        assert "model_hub_score FINAL" in where
+        assert "model_hub_score AS s FINAL" in where
         # The column on model_hub_score is simply label_id (not annotation_label_id).
         assert "label_id" in where
         assert "_peerdb_is_deleted = 0" in where
+
+    def test_annotation_number_not_equal_to_alias(self):
+        """Frontend number op not_equal_to should translate to SQL !=."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder()
+        filters = [
+            {
+                "column_id": "00000000-0000-0000-0000-000000000066",
+                "filter_config": {
+                    "filter_type": "number",
+                    "filter_op": "not_equal_to",
+                    "filter_value": 45,
+                    "col_type": "ANNOTATION",
+                },
+            }
+        ]
+        where, params = builder.translate(filters)
+
+        assert "model_hub_score AS s FINAL" in where
+        assert ") != %(ann_" in where
+        assert "45" not in where
+        assert 45 in params.values()
+
+    def test_annotation_number_not_between_alias(self):
+        """Frontend number op not_between should translate to SQL NOT BETWEEN."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder()
+        filters = [
+            {
+                "column_id": "00000000-0000-0000-0000-000000000066",
+                "filter_config": {
+                    "filter_type": "number",
+                    "filter_op": "not_between",
+                    "filter_value": [10, 50],
+                    "col_type": "ANNOTATION",
+                },
+            }
+        ]
+        where, params = builder.translate(filters)
+
+        assert "model_hub_score AS s FINAL" in where
+        assert "NOT BETWEEN" in where
+        assert 10 in params.values()
+        assert 50 in params.values()
+
+    def test_annotation_positive_operator_aliases(self):
+        """Frontend positive op aliases should translate to canonical SQL."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        label_id = "00000000-0000-0000-0000-000000000066"
+        cases = [
+            ("number", "equal_to", 45, ") = %(ann_", {45}),
+            ("number", "inBetween", [10, 50], " BETWEEN ", {10, 50}),
+            ("text", "is", "good", ") = lower(%(ann_", {"good"}),
+            ("text", "is_not", "bad", ") != lower(%(ann_", {"bad"}),
+        ]
+
+        for filter_type, filter_op, value, sql_fragment, expected_values in cases:
+            builder = ClickHouseFilterBuilder()
+            where, params = builder.translate(
+                [
+                    {
+                        "column_id": label_id,
+                        "filter_config": {
+                            "filter_type": filter_type,
+                            "filter_op": filter_op,
+                            "filter_value": value,
+                            "col_type": "ANNOTATION",
+                        },
+                    }
+                ]
+            )
+
+            assert "model_hub_score AS s FINAL" in where
+            assert sql_fragment in where
+            assert expected_values.issubset(set(params.values()))
+
+    def test_unknown_operator_does_not_fall_back_to_equals(self):
+        """Unsupported operators should match nothing instead of becoming =."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder()
+        filters = [
+            {
+                "column_id": "model",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "definitely_not_supported",
+                    "filter_value": "gpt-4",
+                    "col_type": "SYSTEM_METRIC",
+                },
+            }
+        ]
+        where, params = builder.translate(filters)
+
+        assert "0 = 1" in where
+        assert "definitely_not_supported" not in where
+        assert " = %(col_" not in where
+        assert params == {}
+
+    def test_empty_in_filters_do_not_emit_invalid_clickhouse_sql(self):
+        """Empty IN arrays should not serialize to invalid IN () syntax."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        for filter_op, expected in (("in", "0 = 1"), ("not_in", "1 = 1")):
+            builder = ClickHouseFilterBuilder()
+            where, params = builder.translate(
+                [
+                    {
+                        "column_id": "status",
+                        "filter_config": {
+                            "filter_type": "text",
+                            "filter_op": filter_op,
+                            "filter_value": [],
+                            "col_type": "SYSTEM_METRIC",
+                        },
+                    }
+                ]
+            )
+
+            assert expected in where
+            assert "IN %(" not in where
+            assert "IN ()" not in where
+            assert params == {}
+
+    def test_annotation_text_not_equals_requires_existing_annotation(self):
+        """Text not-equals should not include rows with no annotation."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder()
+        filters = [
+            {
+                "column_id": "00000000-0000-0000-0000-000000000066",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "not_equals",
+                    "filter_value": "bad",
+                    "col_type": "ANNOTATION",
+                },
+            }
+        ]
+        where, params = builder.translate(filters)
+
+        assert "trace_id IN (" in where
+        assert "trace_id NOT IN" not in where
+        assert "!= lower" in where
+        assert "bad" in params.values()
+
+    def test_annotation_label_types_translate_to_expected_storage_shapes(self):
+        """All FE annotation label types should hit the matching Score JSON shape."""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        label_id = "00000000-0000-0000-0000-000000000066"
+        cases = [
+            (
+                {
+                    "filter_type": "number",
+                    "filter_op": "equals",
+                    "filter_value": 4,
+                    "col_type": "ANNOTATION",
+                },
+                ["JSONExtractFloat", "'rating'", "'value'", ") = %(ann_"],
+                {4},
+            ),
+            (
+                {
+                    "filter_type": "text",
+                    "filter_op": "starts_with",
+                    "filter_value": "needs",
+                    "col_type": "ANNOTATION",
+                },
+                ["JSONExtractString", "'text'", "ILIKE"],
+                {"needs%"},
+            ),
+            (
+                {
+                    "filter_type": "thumbs",
+                    "filter_op": "in",
+                    "filter_value": ["Thumbs Up", "down"],
+                    "col_type": "ANNOTATION",
+                },
+                ["JSONExtractString", "'value'", " IN %(ann_"],
+                {("up", "down")},
+            ),
+            (
+                {
+                    "filter_type": "categorical",
+                    "filter_op": "contains",
+                    "filter_value": ["refund", "billing"],
+                    "col_type": "ANNOTATION",
+                },
+                ["JSONExtract", "'selected'", "has(", " OR "],
+                {"refund", "billing"},
+            ),
+            (
+                {
+                    "filter_type": "categorical",
+                    "filter_op": "not_contains",
+                    "filter_value": ["refund"],
+                    "col_type": "ANNOTATION",
+                },
+                ["JSONExtract", "'selected'", "has(", "AND NOT ("],
+                {"refund"},
+            ),
+            (
+                {
+                    "filter_type": "annotator",
+                    "filter_op": "equals",
+                    "filter_value": [
+                        "11111111-1111-1111-1111-111111111111",
+                        "22222222-2222-2222-2222-222222222222",
+                    ],
+                    "col_type": "ANNOTATION",
+                },
+                ["s.annotator_id IN", "toUUID(%(ann_"],
+                {
+                    "11111111-1111-1111-1111-111111111111",
+                    "22222222-2222-2222-2222-222222222222",
+                },
+            ),
+        ]
+
+        for config, expected_fragments, expected_values in cases:
+            builder = ClickHouseFilterBuilder()
+            where, params = builder.translate(
+                [
+                    {
+                        "column_id": label_id,
+                        "filter_config": config,
+                    }
+                ]
+            )
+
+            assert "model_hub_score AS s FINAL" in where
+            for fragment in expected_fragments:
+                assert fragment in where
+            assert expected_values.issubset(set(params.values()))
 
     def test_is_null_system_metric(self):
         """IS NULL on system metric column."""
@@ -4083,7 +5227,7 @@ class TestVoiceCallListQueryBuilder:
         )
         query, params = builder.build_eval_query(["trace-1", "trace-2"])
         assert "tracer_eval_logger" in query
-        assert "avg(output_float)" in query
+        assert "avgIf" in query
         assert params["trace_ids"] == ("trace-1", "trace-2")
         assert params["eval_config_ids"] == ("eval-1", "eval-2")
 
@@ -4100,6 +5244,118 @@ class TestVoiceCallListQueryBuilder:
         query, params = builder.build_eval_query([])
         assert query == ""
         assert params == {}
+
+    def test_eval_query_filters_errored_rows(self):
+        """Eval query should exclude errored rows from score aggregation."""
+        from tracer.services.clickhouse.query_builders.voice_call_list import (
+            VoiceCallListQueryBuilder,
+        )
+
+        builder = VoiceCallListQueryBuilder(
+            project_id="proj-1",
+            eval_config_ids=["eval-1"],
+        )
+        query, _ = builder.build_eval_query(["trace-1"])
+        assert "error = 0" in query
+        assert "success_count" in query
+        assert "error_count" in query
+
+    def test_eval_query_returns_8_columns(self):
+        """Eval query should return all 8 columns expected by pivot_eval_results."""
+        from tracer.services.clickhouse.query_builders.voice_call_list import (
+            VoiceCallListQueryBuilder,
+        )
+
+        builder = VoiceCallListQueryBuilder(
+            project_id="proj-1",
+            eval_config_ids=["eval-1"],
+        )
+        query, _ = builder.build_eval_query(["trace-1"])
+        for col_name in [
+            "avg_score",
+            "pass_rate",
+            "success_count",
+            "error_count",
+            "eval_count",
+            "str_lists",
+        ]:
+            assert col_name in query, f"Missing column: {col_name}"
+
+    def test_pivot_eval_results_all_errored(self):
+        """When all evals errored, pivot should return error marker."""
+        from tracer.services.clickhouse.query_builders.trace_list import (
+            TraceListQueryBuilder,
+        )
+
+        rows = [
+            ("t1", "cfg-1", None, None, 0, 3, 3, []),
+        ]
+        columns = [
+            "trace_id",
+            "eval_config_id",
+            "avg_score",
+            "pass_rate",
+            "success_count",
+            "error_count",
+            "eval_count",
+            "str_lists",
+        ]
+        result = TraceListQueryBuilder.pivot_eval_results(rows, columns)
+        assert result["t1"]["cfg-1"] == {"error": True}
+
+    def test_pivot_eval_results_partial_errors(self):
+        """When some evals succeed and some error, should return scores not error."""
+        from tracer.services.clickhouse.query_builders.trace_list import (
+            TraceListQueryBuilder,
+        )
+
+        rows = [
+            ("t1", "cfg-1", 0.75, None, 2, 1, 3, []),
+        ]
+        columns = [
+            "trace_id",
+            "eval_config_id",
+            "avg_score",
+            "pass_rate",
+            "success_count",
+            "error_count",
+            "eval_count",
+            "str_lists",
+        ]
+        result = TraceListQueryBuilder.pivot_eval_results(rows, columns)
+        assert result["t1"]["cfg-1"]["avg_score"] == 75.0
+        assert "error" not in result["t1"]["cfg-1"]
+
+    def test_pivot_eval_results_error_with_dict_rows(self):
+        """Error detection should work with dict-style rows from CH client."""
+        from tracer.services.clickhouse.query_builders.trace_list import (
+            TraceListQueryBuilder,
+        )
+
+        rows = [
+            {
+                "trace_id": "t1",
+                "eval_config_id": "cfg-1",
+                "avg_score": None,
+                "pass_rate": None,
+                "success_count": 0,
+                "error_count": 5,
+                "eval_count": 5,
+                "str_lists": [],
+            }
+        ]
+        columns = [
+            "trace_id",
+            "eval_config_id",
+            "avg_score",
+            "pass_rate",
+            "success_count",
+            "error_count",
+            "eval_count",
+            "str_lists",
+        ]
+        result = TraceListQueryBuilder.pivot_eval_results(rows, columns)
+        assert result["t1"]["cfg-1"] == {"error": True}
 
     def test_annotation_query(self):
         """Phase 3 annotation query should filter by trace_ids and label_ids."""
@@ -4184,7 +5440,7 @@ class TestVoiceCallListQueryBuilder:
             ],
         )
         query, params = builder.build()
-        assert "status =" in query
+        assert "lower(status) =" in query
 
 
 @pytest.mark.unit
@@ -4466,7 +5722,7 @@ class TestVoiceCallListQueryBuilderComprehensive:
             ],
         )
         query, _ = builder.build()
-        assert "tracer_eval_logger" in query
+        assert "00000000-0000-0000-0000-000000000000" in query
         assert "trace_id IN" in query
 
     def test_contains_filter(self):
@@ -4764,6 +6020,10 @@ class TestVoiceCallListQueryBuilderComprehensive:
         query, _ = builder.build_annotation_query(["trace-1"], ["label-1"])
         assert "model_hub_score" in query
         assert "trace_id" in query
+        assert "LEFT JOIN spans AS sp" in query
+        assert "sp.id = s.observation_span_id" in query
+        assert "toString(s.trace_id)" in query
+        assert "s.deleted = false" in query
 
     def test_annotation_query_selects_all_value_types(self):
         """Should select the single JSON ``value`` column from model_hub_score.
@@ -4968,8 +6228,8 @@ class TestAnnotationGraphQueryBuilder:
         # Post-revamp: numeric and star annotations live in model_hub_score
         # and may store their value under either `value` or `rating`.
         assert "JSONHas(value, 'rating')" in query
-        assert "JSONExtractFloat(value, 'value')" in query
-        assert "JSONExtractFloat(value, 'rating')" in query
+        assert "JSONExtract(value, 'value', 'Nullable(Float64)')" in query
+        assert "JSONExtract(value, 'rating', 'Nullable(Float64)')" in query
         assert "model_hub_score" in query
         assert "FINAL" in query
         assert "_peerdb_is_deleted = 0" in query
@@ -5059,7 +6319,7 @@ class TestAnnotationGraphQueryBuilder:
             value=None,
         )
         query, _ = builder.build()
-        assert "JSONExtractFloat(value, 'rating')" in query
+        assert "JSONExtract(value, 'rating', 'Nullable(Float64)')" in query
 
     def test_build_text_query(self):
         """Text output type should produce count() per time bucket."""
@@ -5090,7 +6350,7 @@ class TestAnnotationGraphQueryBuilder:
             output_type="unknown_type",
         )
         query, _ = builder.build()
-        assert "JSONExtractFloat(value, 'rating')" in query
+        assert "JSONExtract(value, 'rating', 'Nullable(Float64)')" in query
 
     def test_default_time_range(self):
         """When no dates provided, should default to 7-day range."""
@@ -5391,7 +6651,7 @@ class TestMonitorMetricsQueryBuilder:
         assert params["output_bool_val"] == 1
 
     def test_evaluation_metrics_choices_query(self):
-        """EVALUATION_METRICS with CHOICES should check output_str_list."""
+        """EVALUATION_METRICS with CHOICES should parse output_str_list."""
         from datetime import datetime
 
         builder = self._make_builder(
@@ -5402,7 +6662,8 @@ class TestMonitorMetricsQueryBuilder:
         query, params = builder.build_metric_value_query(
             "evaluation_metrics", datetime(2024, 1, 1), datetime(2024, 1, 31)
         )
-        assert "output_str_list" in query
+        assert "JSONExtract(output_str_list, 'Array(String)')" in query
+        assert "OR output_str =" in query
         assert params["choice_val"] == "Good"
 
     def test_evaluation_metrics_no_config_returns_null(self):
@@ -5463,8 +6724,8 @@ class TestMonitorMetricsQueryBuilder:
         query, _ = builder.build_historical_stats_query(
             "evaluation_metrics", datetime(2024, 1, 1), datetime(2024, 1, 31)
         )
-        assert "avg(output_float) AS mean" in query
-        assert "stddevSamp(output_float) AS stddev" in query
+        assert "avg(output_float)" in query
+        assert "stddevSamp(output_float)" in query
 
     def test_historical_stats_aggregated_metrics_return_null(self):
         """COUNT_OF_ERRORS etc. should return NULL for stats (handled in Python)."""
@@ -5834,3 +7095,399 @@ class TestNewQueryTypeRoutingSettings:
         assert "AnnotationGraphQueryBuilder" in pkg.__all__
         assert "MonitorMetricsQueryBuilder" in pkg.__all__
         assert "SessionAnalyticsQueryBuilder" in pkg.__all__
+
+
+# ============================================================================
+# SPAN_ATTRIBUTE filter contract — exhaustive per-type / per-op coverage
+# ============================================================================
+
+
+def _span_attr_filter(col_id, *, filter_type, filter_op, filter_value=None):
+    """Build a single SPAN_ATTRIBUTE filter dict in the API shape."""
+    return {
+        "column_id": col_id,
+        "filter_config": {
+            "col_type": "SPAN_ATTRIBUTE",
+            "filter_type": filter_type,
+            "filter_op": filter_op,
+            "filter_value": filter_value,
+        },
+    }
+
+
+def _translate_one(filter_dict, *, query_mode="trace"):
+    from tracer.services.clickhouse.query_builders.filters import (
+        ClickHouseFilterBuilder,
+    )
+
+    builder = ClickHouseFilterBuilder(query_mode=query_mode)
+    where, params = builder.translate([filter_dict])
+    return where, params
+
+
+class TestSpanAttrConditionContract:
+    """End-to-end contract tests for _build_span_attr_condition.
+
+    These tests assert on the generated SQL string and the parameter dict
+    (matching the existing TestClickHouseFilterBuilder pattern) — no
+    ClickHouse connection required.
+    """
+
+    # ------------------------------------------------------------------
+    # text type — happy paths
+    # ------------------------------------------------------------------
+    def test_text_equals(self):
+        where, params = _translate_one(
+            _span_attr_filter(
+                "k", filter_type="text", filter_op="equals", filter_value="v"
+            )
+        )
+        assert "span_attr_str" in where
+        assert "mapContains(span_attr_str, 'k')" in where
+        assert "= %(" in where
+        assert "v" in params.values()
+
+    def test_text_not_equals_uses_exists_and(self):
+        """not_equals must require key present (exists AND ...), not the
+        legacy NOT exists OR ... shape that leaked rows past the filter."""
+        where, _ = _translate_one(
+            _span_attr_filter(
+                "k", filter_type="text", filter_op="not_equals", filter_value="v"
+            )
+        )
+        assert "AND span_attr_str['k'] != " in where
+        assert "NOT mapContains" not in where
+
+    def test_text_in(self):
+        where, params = _translate_one(
+            _span_attr_filter(
+                "k", filter_type="text", filter_op="in", filter_value=["a", "b"]
+            )
+        )
+        assert "span_attr_str['k'] IN" in where
+        assert ("a", "b") in params.values()
+
+    def test_text_not_in_uses_exists_and(self):
+        """Regression for the voice-call ended_reason no-op bug.
+        not_in must require key present, NOT use 'NOT exists OR ...'."""
+        where, params = _translate_one(
+            _span_attr_filter(
+                "ended_reason",
+                filter_type="text",
+                filter_op="not_in",
+                filter_value=["voicemail", "assistant-ended-call"],
+            )
+        )
+        assert "mapContains(span_attr_str, 'ended_reason')" in where
+        assert "AND span_attr_str['ended_reason'] NOT IN" in where
+        assert "NOT mapContains" not in where
+        assert ("voicemail", "assistant-ended-call") in params.values()
+
+    def test_text_contains_wildcard(self):
+        where, params = _translate_one(
+            _span_attr_filter(
+                "k", filter_type="text", filter_op="contains", filter_value="abc"
+            )
+        )
+        assert "LIKE" in where
+        assert "%abc%" in params.values()
+
+    def test_text_not_contains_uses_exists_and(self):
+        where, params = _translate_one(
+            _span_attr_filter(
+                "k", filter_type="text", filter_op="not_contains", filter_value="abc"
+            )
+        )
+        assert "AND span_attr_str['k'] NOT LIKE" in where
+        assert "NOT mapContains" not in where
+        assert "%abc%" in params.values()
+
+    def test_text_starts_with(self):
+        _, params = _translate_one(
+            _span_attr_filter(
+                "k", filter_type="text", filter_op="starts_with", filter_value="abc"
+            )
+        )
+        assert "abc%" in params.values()
+
+    def test_text_ends_with(self):
+        _, params = _translate_one(
+            _span_attr_filter(
+                "k", filter_type="text", filter_op="ends_with", filter_value="abc"
+            )
+        )
+        assert "%abc" in params.values()
+
+    def test_text_is_null(self):
+        where, _ = _translate_one(
+            _span_attr_filter("k", filter_type="text", filter_op="is_null")
+        )
+        assert "NOT mapContains(span_attr_str, 'k')" in where
+
+    def test_text_is_not_null(self):
+        where, _ = _translate_one(
+            _span_attr_filter("k", filter_type="text", filter_op="is_not_null")
+        )
+        assert "mapContains(span_attr_str, 'k')" in where
+        assert "NOT mapContains" not in where
+
+    # ------------------------------------------------------------------
+    # number type — happy paths + coercion
+    # ------------------------------------------------------------------
+    def test_number_equals_coerces_string_to_float(self):
+        """FE always ships numerics as strings; backend must coerce to
+        float so CH does numeric (not lexical) comparison."""
+        _, params = _translate_one(
+            _span_attr_filter(
+                "n", filter_type="number", filter_op="equals", filter_value="42"
+            )
+        )
+        assert 42.0 in params.values()
+        assert "42" not in [v for v in params.values() if isinstance(v, str)]
+
+    def test_number_greater_than(self):
+        where, params = _translate_one(
+            _span_attr_filter(
+                "n",
+                filter_type="number",
+                filter_op="greater_than",
+                filter_value="100",
+            )
+        )
+        assert "span_attr_num" in where
+        assert "> %(" in where
+        assert 100.0 in params.values()
+
+    def test_number_between_coerces_each_bound(self):
+        where, params = _translate_one(
+            _span_attr_filter(
+                "n",
+                filter_type="number",
+                filter_op="between",
+                filter_value=["10", "50"],
+            )
+        )
+        assert "BETWEEN" in where
+        assert 10.0 in params.values()
+        assert 50.0 in params.values()
+
+    def test_number_not_between_uses_exists_and(self):
+        where, _ = _translate_one(
+            _span_attr_filter(
+                "n",
+                filter_type="number",
+                filter_op="not_between",
+                filter_value=["10", "50"],
+            )
+        )
+        assert "AND span_attr_num['n'] NOT BETWEEN" in where
+        assert "NOT mapContains" not in where
+
+    def test_number_legacy_not_in_between_is_rejected(self):
+        """`not_in_between` is the retired alias. Builder must raise."""
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "n",
+                    filter_type="number",
+                    filter_op="not_in_between",
+                    filter_value=["10", "50"],
+                )
+            )
+
+    def test_number_between_with_single_element_raises(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "n",
+                    filter_type="number",
+                    filter_op="between",
+                    filter_value=["10"],
+                )
+            )
+
+    def test_number_between_with_non_list_raises(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "n",
+                    filter_type="number",
+                    filter_op="between",
+                    filter_value="10",
+                )
+            )
+
+    def test_number_greater_than_with_non_numeric_raises(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "n",
+                    filter_type="number",
+                    filter_op="greater_than",
+                    filter_value="abc",
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # boolean type — strict native bool only
+    # ------------------------------------------------------------------
+    def test_boolean_equals_true(self):
+        where, params = _translate_one(
+            _span_attr_filter(
+                "b", filter_type="boolean", filter_op="equals", filter_value=True
+            )
+        )
+        assert "span_attr_bool" in where
+        assert 1 in params.values()
+
+    def test_boolean_equals_false(self):
+        _, params = _translate_one(
+            _span_attr_filter(
+                "b", filter_type="boolean", filter_op="equals", filter_value=False
+            )
+        )
+        assert 0 in params.values()
+
+    def test_boolean_string_true_rejected(self):
+        """Strict: only native true/false. `'true'` strings must be rejected."""
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "b",
+                    filter_type="boolean",
+                    filter_op="equals",
+                    filter_value="true",
+                )
+            )
+
+    def test_boolean_int_one_rejected(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "b", filter_type="boolean", filter_op="equals", filter_value=1
+                )
+            )
+
+    def test_boolean_greater_than_rejected_by_contract(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "b",
+                    filter_type="boolean",
+                    filter_op="greater_than",
+                    filter_value=True,
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # type ↔ op contract violations
+    # ------------------------------------------------------------------
+    def test_contains_on_number_rejected(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "n",
+                    filter_type="number",
+                    filter_op="contains",
+                    filter_value="abc",
+                )
+            )
+
+    def test_unknown_op_rejected(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "k",
+                    filter_type="text",
+                    filter_op="somethingelse",
+                    filter_value="v",
+                )
+            )
+
+    def test_unknown_filter_type_rejected(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "k",
+                    filter_type="json",
+                    filter_op="equals",
+                    filter_value="v",
+                )
+            )
+
+    def test_in_with_empty_list_rejected(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "k", filter_type="text", filter_op="in", filter_value=[]
+                )
+            )
+
+    def test_in_with_non_list_rejected(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "k", filter_type="text", filter_op="in", filter_value="a"
+                )
+            )
+
+    def test_equals_with_none_rejected(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "k", filter_type="text", filter_op="equals", filter_value=None
+                )
+            )
+
+    def test_legacy_equal_to_rejected(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "n",
+                    filter_type="number",
+                    filter_op="equal_to",
+                    filter_value="42",
+                )
+            )
+
+    def test_legacy_is_op_rejected(self):
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "k", filter_type="text", filter_op="is", filter_value="v"
+                )
+            )
+
+    def test_sql_injection_via_key_raises(self):
+        """Key sanitizer must reject anything outside [a-zA-Z0-9._-]."""
+        with pytest.raises(ValueError):
+            _translate_one(
+                _span_attr_filter(
+                    "k'; DROP TABLE spans; --",
+                    filter_type="text",
+                    filter_op="equals",
+                    filter_value="v",
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # trace-mode wrap vs span-mode bare
+    # ------------------------------------------------------------------
+    def test_trace_mode_wraps_predicate(self):
+        where, _ = _translate_one(
+            _span_attr_filter(
+                "k", filter_type="text", filter_op="equals", filter_value="v"
+            ),
+            query_mode="trace",
+        )
+        assert "trace_id IN (SELECT trace_id FROM" in where
+
+    def test_span_mode_returns_bare_predicate(self):
+        where, _ = _translate_one(
+            _span_attr_filter(
+                "k", filter_type="text", filter_op="equals", filter_value="v"
+            ),
+            query_mode="span",
+        )
+        assert "trace_id IN (" not in where
+        assert "mapContains" in where
