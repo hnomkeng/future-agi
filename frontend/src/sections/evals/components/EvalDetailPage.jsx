@@ -55,6 +55,7 @@ import EvalUsageTab from "./EvalUsageTab";
 import VersionBadge from "./VersionBadge";
 import { EVAL_TAGS } from "../constant";
 import { FAGI_MODEL_VALUES } from "./ModelSelector";
+import { buildDataInjection } from "src/sections/common/EvalPicker/evalPickerConfigUtils";
 
 const extract_selected_tools = (tools) => {
   if (Array.isArray(tools)) return tools;
@@ -690,11 +691,7 @@ const EvalDetailPage = () => {
       return;
     }
     try {
-      const dataInjection =
-        contextOptions.length === 0 ||
-        (contextOptions.length === 1 && contextOptions[0] === "variables_only")
-          ? { variables_only: true }
-          : { full_row: true };
+      const dataInjection = buildDataInjection(contextOptions);
       const summary =
         summaryType === "custom"
           ? { type: "custom", custom: "" }
@@ -879,12 +876,7 @@ const EvalDetailPage = () => {
       // Save current config to the template so the eval runner uses the latest
       // state.
       if (!isSystemEval && !isComposite) {
-        const dataInjection =
-          contextOptions.length === 0 ||
-          (contextOptions.length === 1 &&
-            contextOptions[0] === "variables_only")
-            ? { variables_only: true }
-            : { full_row: true };
+        const dataInjection = buildDataInjection(contextOptions);
         const summary =
           summaryType === "custom"
             ? { type: "custom", custom: "" }
