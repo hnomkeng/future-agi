@@ -610,9 +610,12 @@ def _run_evaluation(
             except ImportError:
                 token_usage_properties = lambda token_usage: {}
 
-            actual_cost = getattr(eval_instance, "cost", {}).get("total_cost", 0)
+            billing_config = BillingConfig.get()
+            llm_cost = getattr(eval_instance, "cost", {}).get("total_cost", 0)
+            per_run_fee = billing_config.get_eval_per_run_fee()
+            actual_cost = llm_cost + per_run_fee
             _token_usage = getattr(eval_instance, "token_usage", {})
-            credits = BillingConfig.get().calculate_ai_credits(actual_cost)
+            credits = billing_config.calculate_ai_credits(actual_cost)
 
             emit(
                 UsageEvent(
@@ -1271,9 +1274,12 @@ def _execute_evaluation(
             except ImportError:
                 token_usage_properties = lambda token_usage: {}
 
-            _actual_cost = (result.cost or {}).get("total_cost", 0)
+            billing_config = BillingConfig.get()
+            _llm_cost = (result.cost or {}).get("total_cost", 0)
+            _per_run_fee = billing_config.get_eval_per_run_fee()
+            _actual_cost = _llm_cost + _per_run_fee
             _token_usage = result.token_usage or {}
-            credits = BillingConfig.get().calculate_ai_credits(_actual_cost)
+            credits = billing_config.calculate_ai_credits(_actual_cost)
 
             emit(
                 UsageEvent(
@@ -2572,9 +2578,12 @@ def _execute_evaluation_for_trace(
             except ImportError:
                 token_usage_properties = lambda token_usage: {}
 
-            _actual_cost = (result.cost or {}).get("total_cost", 0)
+            billing_config = BillingConfig.get()
+            _llm_cost = (result.cost or {}).get("total_cost", 0)
+            _per_run_fee = billing_config.get_eval_per_run_fee()
+            _actual_cost = _llm_cost + _per_run_fee
             _token_usage = result.token_usage or {}
-            credits = BillingConfig.get().calculate_ai_credits(_actual_cost)
+            credits = billing_config.calculate_ai_credits(_actual_cost)
 
             emit(
                 UsageEvent(
@@ -2840,9 +2849,12 @@ def _execute_evaluation_for_session(
             except ImportError:
                 token_usage_properties = lambda token_usage: {}
 
-            _actual_cost = (result.cost or {}).get("total_cost", 0)
+            billing_config = BillingConfig.get()
+            _llm_cost = (result.cost or {}).get("total_cost", 0)
+            _per_run_fee = billing_config.get_eval_per_run_fee()
+            _actual_cost = _llm_cost + _per_run_fee
             _token_usage = result.token_usage or {}
-            credits = BillingConfig.get().calculate_ai_credits(_actual_cost)
+            credits = billing_config.calculate_ai_credits(_actual_cost)
 
             emit(
                 UsageEvent(
