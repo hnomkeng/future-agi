@@ -1013,10 +1013,12 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     except EndUser.DoesNotExist:
                         raise Exception("User not found")  # noqa: B904
 
-            # In org-scoped mode with a user filter, narrow session_ids
-            # to only those that have spans for this user BEFORE the
-            # heavy aggregation. Without this, the aggregation scans
-            # ALL sessions across ALL projects and times out.
+            # In org-scoped mode with a user filter, narrow session_ids to
+            # only those linked to this user's spans BEFORE the heavy
+            # aggregation. Without this, the GROUP BY scans every session
+            # in every org project and exceeds PG's 30s statement_timeout.
+            # In single-project mode session_ids is already bounded by
+            # project_id, so the planner handles it without help.
             if org_scope and end_user_filter:
                 user_session_ids = list(
                     ObservationSpan.objects.filter(
@@ -1024,7 +1026,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                         **end_user_filter,
                     )
                     .values_list("trace__session_id", flat=True)
-                    .distinct()[:1000]
+                    .distinct()
                 )
                 if not user_session_ids:
                     return self._gm.success_response(
