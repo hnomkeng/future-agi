@@ -488,7 +488,7 @@ class TestClickHouseFilterBuilder:
 
         where, params = builder.translate(filters)
 
-        assert "name IN" in where
+        assert "lower(name) IN" in where
         assert "span_attr_" not in where
         assert "trace_id IN" not in where
         assert tuple(params.values()) == (("response",),)
@@ -517,7 +517,7 @@ class TestClickHouseFilterBuilder:
         where, params = builder.translate(filters)
 
         assert "trace_id IN" in where
-        assert "name IN" in where
+        assert "lower(name) IN" in where
         assert "span_attr_" not in where
         assert "parent_span_id" not in where
         assert tuple(params.values()) == (("response",),)
@@ -546,7 +546,7 @@ class TestClickHouseFilterBuilder:
         where, params = builder.translate(filters)
 
         assert "trace_id IN" in where
-        assert "name IN" in where
+        assert "lower(name) IN" in where
         assert "parent_span_id IS NULL OR parent_span_id = ''" in where
         assert tuple(params.values()) == (("root trace",),)
 
@@ -4556,7 +4556,7 @@ class TestFilterBuilderEdgeCases:
         assert "!=" in where
 
     def test_not_contains_filter(self):
-        """not_contains should produce NOT LIKE."""
+        """not_contains should produce NOT ILIKE (case-insensitive)."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -4574,7 +4574,7 @@ class TestFilterBuilderEdgeCases:
             }
         ]
         where, _ = builder.translate(filters)
-        assert "NOT LIKE" in where
+        assert "NOT ILIKE" in where
 
     def test_starts_with_filter(self):
         """starts_with should produce LIKE with trailing %."""
@@ -4700,7 +4700,7 @@ class TestFilterBuilderEdgeCases:
         assert "<=" in where
 
     def test_span_attr_not_contains(self):
-        """SPAN_ATTRIBUTE not_contains should produce NOT LIKE."""
+        """SPAN_ATTRIBUTE not_contains should produce NOT ILIKE (case-insensitive)."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -4718,7 +4718,7 @@ class TestFilterBuilderEdgeCases:
             }
         ]
         where, _ = builder.translate(filters)
-        assert "NOT LIKE" in where
+        assert "NOT ILIKE" in where
         assert "span_attr_str" in where
 
     def test_span_attr_between(self):
@@ -7043,7 +7043,7 @@ class TestSpanAttrConditionContract:
                 "k", filter_type="text", filter_op="not_equals", filter_value="v"
             )
         )
-        assert "AND span_attr_str['k'] != " in where
+        assert "AND lower(span_attr_str['k']) != " in where
         assert "NOT mapContains" not in where
 
     def test_text_in(self):
@@ -7052,7 +7052,7 @@ class TestSpanAttrConditionContract:
                 "k", filter_type="text", filter_op="in", filter_value=["a", "b"]
             )
         )
-        assert "span_attr_str['k'] IN" in where
+        assert "lower(span_attr_str['k']) IN" in where
         assert ("a", "b") in params.values()
 
     def test_text_not_in_uses_exists_and(self):
@@ -7067,7 +7067,7 @@ class TestSpanAttrConditionContract:
             )
         )
         assert "mapContains(span_attr_str, 'ended_reason')" in where
-        assert "AND span_attr_str['ended_reason'] NOT IN" in where
+        assert "AND lower(span_attr_str['ended_reason']) NOT IN" in where
         assert "NOT mapContains" not in where
         assert ("voicemail", "assistant-ended-call") in params.values()
 
@@ -7086,7 +7086,7 @@ class TestSpanAttrConditionContract:
                 "k", filter_type="text", filter_op="not_contains", filter_value="abc"
             )
         )
-        assert "AND span_attr_str['k'] NOT LIKE" in where
+        assert "AND span_attr_str['k'] NOT ILIKE" in where
         assert "NOT mapContains" not in where
         assert "%abc%" in params.values()
 

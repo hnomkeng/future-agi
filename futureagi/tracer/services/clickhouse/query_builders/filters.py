@@ -15,6 +15,7 @@ from tracer.utils.constants import (
     NO_VALUE_OPS,
     RANGE_OPS,
     SPAN_ATTR_ALLOWED_OPS,
+    FilterType,
 )
 
 from tracer.utils.filter_operators import normalize_filter_op
@@ -39,9 +40,9 @@ def _coerce_strict_bool(v: Any) -> int:
 
 
 _SPAN_ATTR_TYPE_META: Dict[str, Tuple[str, Callable[[Any], Any]]] = {
-    "text":    ("span_attr_str",  lambda v: v if isinstance(v, str) else str(v)),
-    "number":  ("span_attr_num",  lambda v: float(v)),
-    "boolean": ("span_attr_bool", _coerce_strict_bool),
+    FilterType.TEXT.value:    ("span_attr_str",  lambda v: v if isinstance(v, str) else str(v)),
+    FilterType.NUMBER.value:  ("span_attr_num",  lambda v: float(v)),
+    FilterType.BOOLEAN.value: ("span_attr_bool", _coerce_strict_bool),
 }
 
 class ClickHouseFilterBuilder:
@@ -670,7 +671,7 @@ class ClickHouseFilterBuilder:
             exists_predicate,
             filter_op,
             normalized_value,
-            case_insensitive=(normalized_filter_type == "text"),
+            case_insensitive=(normalized_filter_type == FilterType.TEXT.value),
         )
         if not inner_predicate:
             return None
@@ -749,7 +750,7 @@ class ClickHouseFilterBuilder:
     ) -> Optional[str]:
         """Emit the row-level predicate; negation ops require key present.
 
-        ``case_insensitive`` is set for text-typed span attributes (TH-4993):
+        ``case_insensitive`` is set for text-typed span attributes:
         equality/in collapse both sides via ``lower(...)``; LIKE-family ops
         switch to ``ILIKE``.
         """
