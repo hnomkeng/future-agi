@@ -528,11 +528,11 @@ class ClickHouseFilterBuilder:
         tracer_enduser, then map to end_user_id on spans."""
 
         if filter_op in NO_VALUE_OPS:
-            outer_op = "NOT IN" if filter_op == "is_null" else "IN"
+            comparison_op = "=" if filter_op == "is_null" else "!="
             return (
-                f"trace_id {outer_op} ("
+                f"trace_id IN ("
                 f"SELECT trace_id FROM {self.table} "
-                f"WHERE end_user_id != toUUID('00000000-0000-0000-0000-000000000000') "
+                f"WHERE end_user_id {comparison_op} toUUID('00000000-0000-0000-0000-000000000000') "
                 f"AND _peerdb_is_deleted = 0)"
             )
 
@@ -566,7 +566,7 @@ class ClickHouseFilterBuilder:
             f"WHERE end_user_id IN ("
             f"SELECT id FROM tracer_enduser FINAL "
             f"WHERE {inner} "
-            f"AND _peerdb_is_deleted = 0"
+            f"AND _peerdb_is_deleted = 0 AND deleted = 0"
             f") AND _peerdb_is_deleted = 0)"
         )
 
