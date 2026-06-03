@@ -7,8 +7,13 @@ import jinja2
 from jinja2 import Environment
 
 from agentic_eval.core.llm.llm import LLM
+from agentic_eval.core.utils.jinja_utils import nest_dotted_value
 from agentic_eval.core.utils.json_utils import extract_dict_from_string
-from agentic_eval.core.utils.llm_payloads import detect_and_build_media_blocks
+from agentic_eval.core.utils.llm_payloads import (
+    choices_judge_instructions,
+    detect_and_build_media_blocks,
+    response_format_schema,
+)
 from agentic_eval.core.utils.model_config import ModelConfigs
 from agentic_eval.core_evals.fi_utils.evals_result import EvalResult
 import structlog
@@ -18,6 +23,10 @@ from agentic_eval.core_evals.fi_utils.utils import PreserveUndefined
 
 from agentic_eval.core_evals.fi_evals.eval_type import LlmEvalTypeId
 
+# Maximum chars of context that get injected into the eval prompt. Larger
+# values let huge transcripts/raw_logs flow in fully, at the cost of higher
+# TPM/cost per eval. Tuned for the 200K-window judge models. See TH-4905.
+_MAX_CONTEXT_CHARS = 200000
 
 class CustomPromptEvaluator(LLM):
     """
@@ -100,36 +109,6 @@ class CustomPromptEvaluator(LLM):
         # Use rule_prompt as the template
         return self.rule_prompt
 
-    def _build_response_format(self) -> dict:
-        """Build a json_schema response_format based on the eval output type.
-
-        Uses json_schema (not json_object) so the gateway can translate it
-        to provider-native structured output for all backends (Bedrock,
-        Anthropic, Gemini, OpenAI, etc.).
-        """
-        if self._output_type in ("score", "numeric"):
-            result_schema = {"type": "number"}
-        elif self._output_type == "Pass/Fail":
-            result_schema = {"type": "string", "enum": ["Pass", "Fail"]}
-        elif self._output_type == "choices" and getattr(self, "_choices", None):
-            result_schema = {"type": "string", "enum": self._choices}
-        else:
-            result_schema = {"type": "string"}
-        return {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "eval_result",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "result": result_schema,
-                        "explanation": {"type": "string"},
-                    },
-                    "required": ["result", "explanation"],
-                },
-            },
-        }
-
     def _system_message(self) -> str:
         judge_preamble = (
             "You are the world's best LLM-as-a-Judge. You evaluate like an expert human reviewer.\n"
@@ -161,20 +140,14 @@ class CustomPromptEvaluator(LLM):
             )
         elif self._output_type == "choices":
             self.system_template_value = "choices " + " ".join(self._choices)
-            choices_str = ", ".join(f'"{c}"' for c in self._choices)
-            # Build score hint if choice_scores are available
             score_hint = ""
             if hasattr(self, "_choice_scores") and self._choice_scores:
                 score_parts = [f'"{k}" = {v}' for k, v in self._choice_scores.items()]
                 score_hint = f"\nScore mapping: {', '.join(score_parts)}\n"
-            return (
-                judge_preamble +
-                f"You MUST select EXACTLY ONE of these choices: {choices_str}\n"
-                f"Do NOT make up new choices. Do NOT return a number. Return ONLY one of the listed choices.\n"
-                f"{score_hint}"
-                "You MUST return a JSON object with the following fields:\n"
-                f"- result: MUST be exactly one of: {choices_str}. No other value is allowed.\n"
-                "- explanation: An explanation of why you selected this choice.\n"
+            return judge_preamble + choices_judge_instructions(
+                self._choices,
+                multi_choice=getattr(self, "_multi_choice", False),
+                score_hint=score_hint,
             )
         return ""
 
@@ -209,12 +182,12 @@ class CustomPromptEvaluator(LLM):
                 raise ValueError(f"Missing required key in kwargs: {key}")
             value = kwargs[key]
             # Apply context windowing for large values (traces, spans, JSON blobs)
-            if isinstance(value, str) and len(value) > 15000:
-                value = fit_to_context(value, max_total_chars=15000, label=key)
+            if isinstance(value, str) and len(value) > _MAX_CONTEXT_CHARS:
+                value = fit_to_context(value, max_total_chars=_MAX_CONTEXT_CHARS, label=key)
             elif isinstance(value, (dict, list)):
                 serialized = json.dumps(value, default=str)
-                if len(serialized) > 15000:
-                    value = fit_to_context(value, max_total_chars=15000, label=key)
+                if len(serialized) > _MAX_CONTEXT_CHARS:
+                    value = fit_to_context(value, max_total_chars=_MAX_CONTEXT_CHARS, label=key)
             template_context[key] = value
 
         # Render the rule prompt with the template context using Jinja2
@@ -245,6 +218,12 @@ class CustomPromptEvaluator(LLM):
                     prompt_to_render = prompt_to_render.replace(
                         "{{ " + stripped + " }}", replacement
                     )
+                elif "." in stripped and stripped in safe_context:
+                    # Jinja parses dots as nested access; numeric segments
+                    # become list indices.
+                    parts = stripped.split(".")
+                    value = safe_context.pop(stripped)
+                    nest_dotted_value(safe_context, parts, value)
 
             # In Jinja mode, parse JSON strings to native objects right
             # before rendering so {% for %} loops work correctly.
@@ -291,12 +270,12 @@ class CustomPromptEvaluator(LLM):
             rendered_prompt += "\n\n## Data\n"
             if isinstance(row_context, (dict, list)):
                 rendered_prompt += fit_row_to_context(
-                    row_context, max_chars=15000
+                    row_context, max_chars=_MAX_CONTEXT_CHARS
                 )
             else:
                 ctx_str = str(row_context)
-                if len(ctx_str) > 15000:
-                    ctx_str = fit_to_context(ctx_str, max_total_chars=15000, label="data")
+                if len(ctx_str) > _MAX_CONTEXT_CHARS:
+                    ctx_str = fit_to_context(ctx_str, max_total_chars=_MAX_CONTEXT_CHARS, label="data")
                 rendered_prompt += ctx_str
 
         logger.info(
@@ -427,7 +406,11 @@ class CustomPromptEvaluator(LLM):
                     messages=messages,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
-                    response_format=self._build_response_format(),
+                    response_format=response_format_schema(
+                        self._output_type,
+                        getattr(self, "_choices", None),
+                        multi_choice=bool(getattr(self, "_multi_choice", False)),
+                    ),
                     knowledge_base_id=self.knowledge_base_id,
                     check_internet=self.check_internet,
                     detected_media_types=detected_media_types,
@@ -437,7 +420,11 @@ class CustomPromptEvaluator(LLM):
             else:
                 chat_completion_response = self.call_llm(
                     prompt=messages, provider=self.provider,
-                    response_format=self._build_response_format(),
+                    response_format=response_format_schema(
+                        self._output_type,
+                        getattr(self, "_choices", None),
+                        multi_choice=bool(getattr(self, "_multi_choice", False)),
+                    ),
                 )
 
             logger.info(

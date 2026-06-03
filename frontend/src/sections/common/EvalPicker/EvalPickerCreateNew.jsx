@@ -23,6 +23,7 @@ import React, {
 import { useWatch } from "react-hook-form";
 import Iconify from "src/components/iconify";
 import { ShowComponent } from "src/components/show/ShowComponent";
+import CustomTooltip from "src/components/tooltip/CustomTooltip";
 import ResizablePanels from "src/components/resizablePanels/ResizablePanels";
 import TaskFilterBar from "src/sections/tasks/components/TaskFilterBar";
 import { buildApiFilterArray } from "src/sections/tasks/components/TaskLivePreview";
@@ -48,10 +49,12 @@ import DatasetTestMode from "src/sections/evals/components/DatasetTestMode";
 import TracingTestMode from "src/sections/evals/components/TracingTestMode";
 import SimulationTestMode from "src/sections/evals/components/SimulationTestMode";
 import { useEvalPickerContext } from "./context/EvalPickerContext";
+import { buildCompositeChildConfigs } from "src/sections/evals/Helpers/compositeRuntimeConfig";
 import {
   contextOptionsForRowType,
   extractCodeEvaluateParams,
 } from "./evalPickerConfigUtils";
+import { useParams } from "react-router";
 
 const TRACING_ROW_TYPE_TO_KEY = {
   Span: "spans",
@@ -124,7 +127,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
   const createEval = useCreateEval();
   const createComposite = useCreateCompositeEval();
   const sourceRef = useRef(null);
-
+  const {testId,executionId} = useParams();
   // Form state (same as EvalCreatePage)
   const [name, setName] = useState("");
   const [mode, setMode] = useState("single");
@@ -180,6 +183,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
         ? null
         : {
             child_template_ids: selectedChildren.map((c) => c.child_id),
+            child_configs: buildCompositeChildConfigs(selectedChildren),
             aggregation_enabled: aggregationEnabled,
             aggregation_function: aggregationFunction,
             composite_child_axis: compositeChildAxis || "",
@@ -259,7 +263,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
       try {
         const data = await createEval.mutateAsync({
           is_draft: true,
-          eval_type: "agent",
+          // eval_type: "agent",
           output_type: "pass_fail",
           model: "turing_large",
           pass_threshold: 0.5,
@@ -274,6 +278,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
   // Auto-save to draft
   const buildPayload = useCallback(
     () => ({
+      eval_type: evalType,
       instructions: evalType === "code" ? "" : instructions,
       code: evalType === "code" ? code : undefined,
       code_language: evalType === "code" ? codeLanguage : undefined,
@@ -376,15 +381,20 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
       if (!code.trim()) next.instructions = "Code is required";
     } else if (!instructions.trim()) {
       next.instructions = "Instructions are required";
-    } else if (
-      !hasDataInjection &&
-      !/\{\{\s*[^{}]+?\s*\}\}/.test(instructions)
-    ) {
-      next.instructions =
-        "Instructions must contain at least one template variable (e.g. {{input}})";
+    } else if (instructions.trim().length < 10) {
+      next.instructions = "Instructions must be at least 10 characters.";
+    } else if (!hasDataInjection) {
+      const hasVar =
+        templateFormat === "jinja"
+          ? extractJinjaVariables(instructions).length > 0
+          : /\{\{\s*[^{}]+?\s*\}\}/.test(instructions);
+      if (!hasVar) {
+        const dialect = templateFormat === "jinja" ? "Jinja" : "Mustache";
+        next.instructions = `Instructions must contain at least one ${dialect} variable (e.g. {{input}})`;
+      }
     }
 
-    if (!sourceReady && source !== "composite" && !hasDataInjection) {
+    if (!sourceReady && source !== "composite") {
       next.mapping = "Map all variables before saving";
     }
 
@@ -569,6 +579,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
         name: name.trim(),
         description: description || null,
         child_template_ids: childIds,
+        child_configs: buildCompositeChildConfigs(selectedChildren),
         aggregation_enabled: aggregationEnabled,
         aggregation_function: aggregationFunction,
         composite_child_axis: compositeChildAxis,
@@ -616,11 +627,42 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
   // `source === "composite"` means this drawer was opened from a composite's
   // child picker with no dataset bound — there's no variable mapping to
   // complete here, so don't gate saving on `sourceReady`.
+  const hasTemplateVariable =
+    templateFormat === "jinja"
+      ? extractJinjaVariables(instructions).length > 0
+      : /\{\{\s*[^{}]+?\s*\}\}/.test(instructions);
+
+  const needsTemplateVariable =
+    evalType !== "code" && !hasDataInjection && !hasTemplateVariable;
+
   const canSave = isComposite
     ? !!name.trim() && selectedChildren.length > 0
     : name.trim() &&
-      (evalType === "code" ? code.trim() : instructions.trim()) &&
-      (source === "composite" || sourceReady || hasDataInjection);
+      (evalType === "code"
+        ? code.trim()
+        : instructions.trim() && !needsTemplateVariable) &&
+      (source === "composite" || sourceReady);
+
+  const getDisabledReason = () => {
+    if (!name.trim()) return "Name is required";
+    if (isComposite) {
+      if (selectedChildren.length === 0) {
+        return "Select at least one child evaluation";
+      }
+      return null;
+    }
+    if (evalType === "code") {
+      if (!code.trim()) return "Code is required";
+      return null;
+    }
+    if (!instructions.trim()) return "Instructions are required";
+    if (needsTemplateVariable) {
+      const dialect = templateFormat === "jinja" ? "Jinja" : "Mustache";
+      return `Instructions must contain at least one ${dialect} variable (e.g. {{input}})`;
+    }
+    return null;
+  };
+  const disabledReason = getDisabledReason();
 
   // Variables from instructions
   const variables = useMemo(() => {
@@ -844,23 +886,27 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
                 <Tabs
                   value={evalType}
                   onChange={(_, val) => setEvalType(val)}
+                  variant="standard"
                   TabIndicatorProps={{ style: { display: "none" } }}
                   sx={{
-                    minHeight: 28,
+                    width: "fit-content",
+                    minHeight: 32,
                     "& .MuiTab-root": {
+                      height: 28,
                       minHeight: 28,
+                      maxHeight: 28,
                       px: 1.5,
                       py: 0,
                       mr: "0px !important",
                       textTransform: "none",
                       fontSize: "13px",
+                      lineHeight: "28px",
                       borderRadius: "6px",
                     },
                     border: "1px solid",
                     borderColor: "divider",
                     p: "2px",
                     borderRadius: "8px",
-                    width: "fit-content",
                     bgcolor: (theme) =>
                       theme.palette.mode === "dark"
                         ? "rgba(255,255,255,0.04)"
@@ -948,6 +994,11 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
                     selectedDatasets={fewShotExamples}
                     onChange={setFewShotExamples}
                   />
+                  {errors.instructions && (
+                    <Typography variant="caption" color="error.main">
+                      {errors.instructions}
+                    </Typography>
+                  )}
                 </>
               )}
 
@@ -991,7 +1042,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
                     >
                       <Typography variant="caption">0</Typography>
                       <Slider
-                        value={passThreshold * 100}
+                        value={Math.round(passThreshold * 100)}
                         onChange={(_, val) =>
                           handlePassThresholdChange(val / 100)
                         }
@@ -1143,6 +1194,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
                     onTestResult={handleTestResult}
                     onColumnsLoaded={handleColumnsLoaded}
                     onReadyChange={handleSourceReadyChange}
+                    hasDataInjection={hasDataInjection}
                     initialProjectId={sourceId}
                     initialRowType={sourceRowType}
                     isComposite={isComposite}
@@ -1158,6 +1210,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
                     onTestResult={handleTestResult}
                     onColumnsLoaded={handleColumnsLoaded}
                     onReadyChange={handleSourceReadyChange}
+                    hasDataInjection={hasDataInjection}
                     onRowTypeChange={handleSourceRowTypeChange}
                     isComposite={isComposite}
                     compositeAdhocConfig={compositeAdhocConfig}
@@ -1174,6 +1227,8 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
                     onColumnsLoaded={handleColumnsLoaded}
                     onReadyChange={handleSourceReadyChange}
                     isComposite={isComposite}
+                    initialRunTestId={testId}
+                    initialExecutionId={executionId}
                     compositeAdhocConfig={compositeAdhocConfig}
                   />
                 )}
@@ -1253,10 +1308,10 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
             </Typography>
           </Box>
         )}
-        {!sourceReady && !hasDataInjection && !testError && !testPassed && (
+        {!sourceReady && !testError && !testPassed && (
           <Typography
             variant="caption"
-            color="text.disabled"
+            color="text.secondary"
             sx={{ mr: "auto", fontSize: "11px" }}
           >
             Map all variables to enable{" "}
@@ -1267,40 +1322,63 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
         <ShowComponent
           condition={!hasDataInjection }
         >
-          <Button
-            variant="outlined"
+          <CustomTooltip
+            show={!!disabledReason}
+            title={disabledReason || ""}
+            arrow
             size="small"
-            onClick={handleTestEvaluation}
-            disabled={
-              isTesting ||
-              (!sourceReady && !hasDataInjection) ||
-              !draftId ||
-              isComposite ||
-              source === "workbench"
-            }
-            startIcon={
-              isTesting ? (
-                <CircularProgress size={14} />
-              ) : (
-                <Iconify icon="mdi:play-circle-outline" width={16} />
-              )
-            }
-            sx={{ textTransform: "none" }}
+            type="black"
+            placement="top"
           >
-            {isTesting ? "Testing..." : "Test Evaluation"}
-          </Button>
+            <span>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={handleTestEvaluation}
+                disabled={
+                  isTesting ||
+                  !!disabledReason ||
+                  !sourceReady ||
+                  !draftId ||
+                  isComposite ||
+                  source === "workbench"
+                }
+                startIcon={
+                  isTesting ? (
+                    <CircularProgress size={14} />
+                  ) : (
+                    <Iconify icon="mdi:play-circle-outline" width={16} />
+                  )
+                }
+                sx={{ textTransform: "none" }}
+              >
+                {isTesting ? "Testing..." : "Test Evaluation"}
+              </Button>
+            </span>
+          </CustomTooltip>
         </ShowComponent>
 
-        <LoadingButton
-          variant="contained"
+        <CustomTooltip
+          show={!!disabledReason}
+          title={disabledReason || ""}
+          arrow
           size="small"
-          loading={isSaving}
-          disabled={!canSave}
-          onClick={isComposite ? handleSaveAndAddComposite : handleSaveAndAdd}
-          sx={{ textTransform: "none" }}
+          type="black"
+          placement="top"
         >
-          {isComposite ? "Create & Configure" : "Save & Add Evaluation"}
-        </LoadingButton>
+          <span>
+            <LoadingButton
+              variant="contained"
+              size="small"
+              loading={isSaving}
+              disabled={!canSave}
+              onClick={isComposite ? handleSaveAndAddComposite : handleSaveAndAdd}
+              sx={{ textTransform: "none" }}
+            >
+              {isComposite ? "Create & Configure" : "Save & Add Evaluation"}
+            </LoadingButton>
+          </span>
+        </CustomTooltip>
       </Box>
     </Box>
   );

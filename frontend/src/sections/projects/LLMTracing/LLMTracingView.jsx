@@ -956,6 +956,12 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   const projectSource = isUserMode
     ? PROJECT_SOURCE.OBSERVE
     : projectDetail?.source;
+
+  const effectiveViewMode =
+    projectSource === PROJECT_SOURCE.SIMULATOR && viewMode !== "graph"
+      ? "graph"
+      : viewMode;
+
   const defaultDateFilter = useMemo(() => getDefaultDateRange(), []);
 
   const [isPrimaryFilterOpen, setIsPrimaryFilterOpen] = useUrlState(
@@ -991,14 +997,20 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   }, [observeId]);
 
   const handleAutoSize = () => {
+    const isSimulator = projectSource === PROJECT_SOURCE.SIMULATOR;
+
     const gridRef =
-      selectedGraph === "primary"
-        ? selectedTab === "trace"
-          ? primaryTraceGridRef
-          : primarySpanGridRef
-        : selectedTab === "trace"
-          ? compareTraceGridRef
-          : compareSpanGridRef;
+      isSimulator && selectedTab === "trace"
+        ? selectedGraph === "primary"
+          ? primaryCallLogsGridRef
+          : compareCallLogsGridRef
+        : selectedGraph === "primary"
+          ? selectedTab === "trace"
+            ? primaryTraceGridRef
+            : primarySpanGridRef
+          : selectedTab === "trace"
+            ? compareTraceGridRef
+            : compareSpanGridRef;
 
     if (!gridRef.current?.api) return;
 
@@ -1168,7 +1180,9 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       : primarySpanValidatedFilters,
     {
       enabled:
-        !isUserMode && (viewMode === "agentGraph" || viewMode === "agentPath"),
+        !isUserMode &&
+        (effectiveViewMode === "agentGraph" ||
+          effectiveViewMode === "agentPath"),
     },
   );
 
@@ -1186,7 +1200,8 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       enabled:
         !isUserMode &&
         showCompare &&
-        (viewMode === "agentGraph" || viewMode === "agentPath"),
+        (effectiveViewMode === "agentGraph" ||
+          effectiveViewMode === "agentPath"),
     },
   );
 
@@ -2095,6 +2110,19 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   const filtersStorageKey = isUserMode
     ? `user-filters-${userIdForUserMode}`
     : `observe-filters-${observeId}`;
+
+  // User-initiated clears (popover "Clear all" / chip-strip "Clear all").
+  // Wipes the localStorage entry too — without this the saved filter
+  // resurrects on the next project mount because the load effect for
+  // `filtersStorageKey` restores any non-empty extraFilters it finds.
+  const clearPrimaryExtraFilters = useCallback(() => {
+    setExtraFilters([]);
+    localStorage.removeItem(filtersStorageKey);
+  }, [setExtraFilters, filtersStorageKey]);
+  const clearCompareExtraFilters = useCallback(() => {
+    setCompareExtraFilters([]);
+    localStorage.removeItem(filtersStorageKey);
+  }, [setCompareExtraFilters, filtersStorageKey]);
 
   // Pending custom cols, queued until the backend returns real columns so
   // the grid doesn't render with only-custom-col headers mid-load. One ref
@@ -3125,7 +3153,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
         >
           {/* Primary Graph — dual-axis bars + line. Hidden in user mode
               (PrimaryGraph requires observeId for its query). */}
-          {viewMode === "graph" && !isUserMode && (
+          {effectiveViewMode === "graph" && !isUserMode && (
             <>
               <PrimaryGraph
                 filters={
@@ -3198,7 +3226,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
           )}
 
           {/* Agent Graph — DAG visualization */}
-          {viewMode === "agentGraph" && (
+          {effectiveViewMode === "agentGraph" && (
             <>
               <Box sx={{ mx: 2, my: 1 }}>
                 {showCompare && (
@@ -3278,7 +3306,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
           )}
 
           {/* Agent Path — sequential flow */}
-          {viewMode === "agentPath" && (
+          {effectiveViewMode === "agentPath" && (
             <>
               <Box>
                 {showCompare && (
@@ -3440,11 +3468,13 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                 setIsPrimaryFilterOpen(!isPrimaryFilterOpen);
               }}
               onApplyExtraFilters={setExtraFilters}
+              onClearExtraFilters={clearPrimaryExtraFilters}
               graphFilters={extraFilters}
               isFilterOpen={isPrimaryFilterOpen}
               externalFilterAnchor={externalFilterAnchor}
               filterTarget={filterTarget}
               onApplyCompareExtraFilters={setCompareExtraFilters}
+              onClearCompareExtraFilters={clearCompareExtraFilters}
               filters={
                 selectedTab === "trace"
                   ? primaryTraceFilters
@@ -3475,7 +3505,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
               onAddCustomColumn={() => setOpenCustomColumn(true)}
               cellHeight={cellHeight}
               setCellHeight={setCellHeight}
-              viewMode={viewMode}
+              viewMode={effectiveViewMode}
               onViewModeChange={setViewMode}
               hasEvalFilter={hasEvalFilter}
               onToggleEvalFilter={() => setHasEvalFilter(!hasEvalFilter)}
@@ -4549,6 +4579,9 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                 enabled={projectSource === PROJECT_SOURCE.SIMULATOR}
                 cellHeight={cellHeight}
                 columnVisibility={columns["primary-trace"]}
+                onColumnsChange={(next) =>
+                  setColumns((prev) => ({ ...prev, "primary-trace": next }))
+                }
                 showErrors={showErrors}
                 params={{
                   project_id: observeId,
@@ -4588,6 +4621,9 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                 enabled={projectSource === PROJECT_SOURCE.SIMULATOR}
                 cellHeight={cellHeight}
                 columnVisibility={columns["compare-trace"]}
+                onColumnsChange={(next) =>
+                  setColumns((prev) => ({ ...prev, "compare-trace": next }))
+                }
                 showErrors={showErrors}
                 hideDrawer
                 params={{

@@ -17,11 +17,13 @@ import {
   startOfYesterday,
   sub,
 } from "date-fns";
+import { NULL_OPERATORS } from "src/components/ComplexFilter/common";
 import Iconify from "src/components/iconify";
 import DisplayPanel from "./DisplayPanel";
 import TraceFilterPanel from "./TraceFilterPanel";
 import BulkActionsBar from "./BulkActionsBar";
 import { useTabStoreShallow } from "./tabStore";
+import { ID_ONLY_FIELDS } from "./idFields";
 import CustomDateRangePicker from "src/components/custom-datepicker/DatePicker";
 import { formatDate } from "src/utils/report-utils";
 
@@ -58,6 +60,10 @@ const ObserveToolbar = ({
   filterDefinition,
   defaultFilter,
   onApplyExtraFilters,
+  // Called when the panel's Clear all (or empty Apply) resets extraFilters
+  // — owns the localStorage cleanup parent state can't reach from here.
+  onClearExtraFilters,
+  onClearCompareExtraFilters,
   // Filter fields override (for sessions/users)
   filterFields,
   // LLM Tracing tab ("trace" | "spans") — when set, TraceFilterPanel
@@ -231,8 +237,9 @@ const ObserveToolbar = ({
         EVAL_METRIC: "eval",
         ANNOTATION: "annotation",
       };
-      const rawColType =
-        gf.filter_config?.col_type || gf.col_type || "SYSTEM_METRIC";
+      const rawColType = ID_ONLY_FIELDS.has(gf.column_id)
+        ? undefined
+        : gf.filter_config?.col_type || gf.col_type || "SYSTEM_METRIC";
       const rawFilterType = gf.filter_config?.filter_type;
       const isGlobalAnnotatorFilter = gf.column_id === "annotator";
       // Auto-migrate legacy saved views: thumbs annotations used to be
@@ -422,8 +429,14 @@ const ObserveToolbar = ({
             onApply={(newFilters) => {
               setPanelFilters(newFilters);
               if (!newFilters || newFilters.length === 0) {
-                if (filterTarget === "compare" && onApplyCompareExtraFilters) {
-                  onApplyCompareExtraFilters([]);
+                if (filterTarget === "compare") {
+                  if (onClearCompareExtraFilters) {
+                    onClearCompareExtraFilters();
+                  } else {
+                    onApplyCompareExtraFilters?.([]);
+                  }
+                } else if (onClearExtraFilters) {
+                  onClearExtraFilters();
                 } else {
                   onApplyExtraFilters?.([]);
                 }
@@ -452,9 +465,13 @@ const ObserveToolbar = ({
               const LEGACY_OP_ALIAS = { is: "equals", is_not: "not_equals" };
               const apiFilters = newFilters.map((f) => {
                 const filterOp = LEGACY_OP_ALIAS[f.operator] || f.operator;
-                const apiColType = f.apiColType || colTypeMap[f.fieldCategory];
-                let filterValue = f.value;
-                if (Array.isArray(filterValue)) {
+                const apiColType = ID_ONLY_FIELDS.has(f.field)
+                  ? undefined
+                  : f.apiColType || colTypeMap[f.fieldCategory];
+                let filterValue = NULL_OPERATORS.includes(filterOp)
+                  ? ""
+                  : f.value;
+                  if (Array.isArray(filterValue)) {
                   if (RANGE_OPS.has(filterOp)) {
                     // Coerce numeric range bounds.
                     filterValue = filterValue.map((v) =>
@@ -674,6 +691,8 @@ ObserveToolbar.propTypes = {
   excludeSimulationCalls: PropTypes.bool,
   onToggleSimulationCalls: PropTypes.func,
   onApplyExtraFilters: PropTypes.func,
+  onClearExtraFilters: PropTypes.func,
+  onClearCompareExtraFilters: PropTypes.func,
   filterFields: PropTypes.array,
   tab: PropTypes.oneOf(["trace", "spans"]),
   graphFilters: PropTypes.array,

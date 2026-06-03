@@ -42,6 +42,7 @@ import {
   getPickerOptionSecondaryLabel,
   getPickerOptionValue,
 } from "./filterValuePickerUtils";
+import { ID_ONLY_FIELDS } from "./idFields";
 
 // ---------------------------------------------------------------------------
 // Trace filter fields (for Query tab via shared FilterPanel)
@@ -173,7 +174,6 @@ const ANNOTATOR_OPS = [{ value: "is", label: "is" }];
 // Direct ID columns on `spans`. UUIDs don't need substring/null ops —
 // restrict to equality (canonical IN / NOT IN, multi-select on the value
 // picker).
-const ID_ONLY_FIELDS = new Set(["trace_id", "span_id", "session"]);
 const ID_ONLY_OPS = [
   { value: "in", label: "equals" },
   { value: "not_in", label: "not equals" },
@@ -316,6 +316,9 @@ const DEFAULT_OP_FOR_TYPE = {
 // Legacy string-field ops in saved views — rewrite on hydration so the menu renders.
 const HYDRATE_STRING_OP = { equals: "in", not_equals: "not_in" };
 
+// Categorical / thumbs ops in saved views — reverse the save-side LEGACY_OP_ALIAS so the menu renders.
+const HYDRATE_CATEGORICAL_OP = { equals: "is", not_equals: "is_not" };
+
 const NO_VALUE_OPS = new Set([
   "is_empty",
   "is_not_empty",
@@ -334,7 +337,7 @@ const SINGLE_VALUE_OPS = new Set([
 ]);
 
 // List ops — multi-select picker.
-const LIST_VALUE_OPS = new Set(["in", "not_in"]);
+const LIST_VALUE_OPS = new Set(["in", "not_in", "is", "is_not"]);
 
 // ---------------------------------------------------------------------------
 // Hook: fetch properties from dashboard metrics
@@ -658,9 +661,9 @@ function PropertyPicker({
                   No properties found
                 </Typography>
               )}
-              {visibleProperties.map((prop) => (
+              {visibleProperties.map((prop, idx) => (
                 <Box
-                  key={prop.id}
+                  key={`${prop.category}:${prop.id}:${idx}`}
                   onClick={() => {
                     onSelect(prop);
                     onClose();
@@ -911,9 +914,42 @@ function ValuePicker({
             {isLoading
               ? "Loading..."
               : options.length === 0
-                ? "Select values..."
-                : "Select values..."}
+                ? singleSelect
+                  ? "No value available"
+                  : "No values available"
+                : singleSelect
+                  ? "Select a value..."
+                  : "Select values..."}
           </Typography>
+        ) : singleSelect ? (
+          // Plain text instead of a chip — chips read as "removable token
+          // in a list", which mis-signals multi-select.
+          (() => {
+            const v = selectedValues[0];
+            const match = options.find((o) => {
+              const ov = typeof o === "string" ? o : o.value;
+              return ov === v;
+            });
+            const displayLabel =
+              (typeof match === "string" ? match : match?.label) || v;
+            return (
+              <Typography
+                key={v}
+                noWrap
+                title={displayLabel}
+                sx={{
+                  fontSize: 12,
+                  color: "text.primary",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  minWidth: 0,
+                  flex: 1,
+                }}
+              >
+                {displayLabel}
+              </Typography>
+            );
+          })()
         ) : (
           selectedValues.slice(0, 3).map((v) => {
             // Resolve the display label from static choices or rendered
@@ -950,7 +986,7 @@ function ValuePicker({
             );
           })
         )}
-        {selectedValues.length > 3 && (
+        {!singleSelect && selectedValues.length > 3 && (
           <Typography sx={{ fontSize: 10, color: "text.disabled" }}>
             +{selectedValues.length - 3}
           </Typography>
@@ -1052,9 +1088,13 @@ function ValuePicker({
               >
                 <Iconify
                   icon={
-                    isSelected
-                      ? "mdi:checkbox-marked"
-                      : "mdi:checkbox-blank-outline"
+                    singleSelect
+                      ? isSelected
+                        ? "mdi:radiobox-marked"
+                        : "mdi:radiobox-blank"
+                      : isSelected
+                        ? "mdi:checkbox-marked"
+                        : "mdi:checkbox-blank-outline"
                   }
                   width={18}
                   sx={{
@@ -1211,7 +1251,10 @@ function FilterRow({
         prop.type === "annotator"
           ? prop.type
           : normalizeFieldType(prop.type);
-      const defaultOp = DEFAULT_OP_FOR_TYPE[nt] || "equals";
+      // ID-only fields only support "is"; fallback would render blank.
+      const defaultOp = ID_ONLY_FIELDS.has(prop.id)
+        ? "is"
+        : DEFAULT_OP_FOR_TYPE[nt] || "equals";
       let defaultValue;
       if (nt === "number" || nt === "date") defaultValue = "";
       else if (nt === "boolean") defaultValue = "true";
@@ -1713,23 +1756,17 @@ const TraceFilterPanel = ({
         const enriched = currentFilters.map((f) => {
           const prop = propertyById[f.field];
           const fieldType = f.fieldType || prop?.type || "string";
-          // ID fields use canonical IN / NOT IN; rehydrate legacy "is" /
-          // "equals" (and the negations) onto the multi-select ops.
-          const ID_OP_HYDRATE = {
-            is: "in",
-            equals: "in",
-            "=": "in",
-            is_not: "not_in",
-            not_equals: "not_in",
-            "!=": "not_in",
-          };
+          // Translate wire ops to the picker's MenuItem values, per fieldType.
           const hydratedOp = ID_ONLY_FIELDS.has(f.field)
-            ? ID_OP_HYDRATE[f.operator] || "in"
-            : (fieldType === "string" || fieldType === "text") &&
-                HYDRATE_STRING_OP[f.operator]
-              ? HYDRATE_STRING_OP[f.operator]
-              : f.operator;
-          // Scalar legacy `equals` value → array for the multi-select picker.
+            ? "is"
+            : (fieldType === "categorical" || fieldType === "thumbs") &&
+                HYDRATE_CATEGORICAL_OP[f.operator]
+              ? HYDRATE_CATEGORICAL_OP[f.operator]
+              : (fieldType === "string" || fieldType === "text") &&
+                  HYDRATE_STRING_OP[f.operator]
+                ? HYDRATE_STRING_OP[f.operator]
+                : f.operator;
+          // Scalar value → array when rewritten op uses a multi-select picker.
           let value = f.value;
           if (
             hydratedOp !== f.operator &&

@@ -238,9 +238,9 @@ class UserIdFilterTests(unittest.TestCase):
             filter_value=None,
         )
         self.assertIsNotNone(sql)
-        self.assertIn("trace_id NOT IN (", sql)
+        self.assertIn("trace_id IN (", sql)
         self.assertNotIn("FROM tracer_enduser", sql)
-        self.assertIn("end_user_id !=", sql)
+        self.assertIn("end_user_id =", sql)
         self.assertIn("00000000-0000-0000-0000-000000000000", sql)
 
     def test_user_id_is_not_null(self):

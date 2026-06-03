@@ -15,6 +15,7 @@ from tracer.utils.constants import (
     NO_VALUE_OPS,
     RANGE_OPS,
     SPAN_ATTR_ALLOWED_OPS,
+    FilterType,
 )
 
 from tracer.utils.filter_operators import normalize_filter_op
@@ -39,9 +40,9 @@ def _coerce_strict_bool(v: Any) -> int:
 
 
 _SPAN_ATTR_TYPE_META: Dict[str, Tuple[str, Callable[[Any], Any]]] = {
-    "text":    ("span_attr_str",  lambda v: v if isinstance(v, str) else str(v)),
-    "number":  ("span_attr_num",  lambda v: float(v)),
-    "boolean": ("span_attr_bool", _coerce_strict_bool),
+    FilterType.TEXT.value:    ("span_attr_str",  lambda v: v if isinstance(v, str) else str(v)),
+    FilterType.NUMBER.value:  ("span_attr_num",  lambda v: float(v)),
+    FilterType.BOOLEAN.value: ("span_attr_bool", _coerce_strict_bool),
 }
 
 class ClickHouseFilterBuilder:
@@ -528,11 +529,11 @@ class ClickHouseFilterBuilder:
         tracer_enduser, then map to end_user_id on spans."""
 
         if filter_op in NO_VALUE_OPS:
-            outer_op = "NOT IN" if filter_op == "is_null" else "IN"
+            comparison_op = "=" if filter_op == "is_null" else "!="
             return (
-                f"trace_id {outer_op} ("
+                f"trace_id IN ("
                 f"SELECT trace_id FROM {self.table} "
-                f"WHERE end_user_id != toUUID('00000000-0000-0000-0000-000000000000') "
+                f"WHERE end_user_id {comparison_op} toUUID('00000000-0000-0000-0000-000000000000') "
                 f"AND _peerdb_is_deleted = 0)"
             )
 
@@ -566,7 +567,7 @@ class ClickHouseFilterBuilder:
             f"WHERE end_user_id IN ("
             f"SELECT id FROM tracer_enduser FINAL "
             f"WHERE {inner} "
-            f"AND _peerdb_is_deleted = 0"
+            f"AND _peerdb_is_deleted = 0 AND deleted = 0"
             f") AND _peerdb_is_deleted = 0)"
         )
 
@@ -670,6 +671,7 @@ class ClickHouseFilterBuilder:
             exists_predicate,
             filter_op,
             normalized_value,
+            case_insensitive=(normalized_filter_type == FilterType.TEXT.value),
         )
         if not inner_predicate:
             return None
@@ -744,9 +746,24 @@ class ClickHouseFilterBuilder:
         exists_predicate: str,
         filter_op: str,
         normalized_value: Any,
+        case_insensitive: bool = False,
     ) -> Optional[str]:
-        """Emit the row-level predicate; negation ops require key present."""
+        """Emit the row-level predicate; negation ops require key present.
+
+        ``case_insensitive`` is set for text-typed span attributes:
+        equality/in collapse both sides via ``lower(...)``; LIKE-family ops
+        switch to ``ILIKE``.
+        """
         column_access = f"{map_column}['{attribute_key}']"
+        eq_lhs = f"lower({column_access})" if case_insensitive else column_access
+        like_op = "ILIKE" if case_insensitive else "LIKE"
+        not_like_op = "NOT ILIKE" if case_insensitive else "NOT LIKE"
+
+        def fold_case(value: Any) -> Any:
+            """Lowercase string values when the column is case-insensitive."""
+            if not case_insensitive:
+                return value
+            return value.lower() if isinstance(value, str) else value
 
         if filter_op == "is_null":
             return f"NOT {exists_predicate}"
@@ -755,38 +772,38 @@ class ClickHouseFilterBuilder:
 
         if filter_op == "equals":
             param = self._next_param("attr")
-            self._params[param] = normalized_value
-            return f"{exists_predicate} AND {column_access} = %({param})s"
+            self._params[param] = fold_case(normalized_value)
+            return f"{exists_predicate} AND {eq_lhs} = %({param})s"
         if filter_op == "not_equals":
             param = self._next_param("attr")
-            self._params[param] = normalized_value
-            return f"{exists_predicate} AND {column_access} != %({param})s"
+            self._params[param] = fold_case(normalized_value)
+            return f"{exists_predicate} AND {eq_lhs} != %({param})s"
 
         if filter_op == "in":
             param = self._next_param("attr")
-            self._params[param] = tuple(normalized_value)
-            return f"{exists_predicate} AND {column_access} IN %({param})s"
+            self._params[param] = tuple(fold_case(v) for v in normalized_value)
+            return f"{exists_predicate} AND {eq_lhs} IN %({param})s"
         if filter_op == "not_in":
             param = self._next_param("attr")
-            self._params[param] = tuple(normalized_value)
-            return f"{exists_predicate} AND {column_access} NOT IN %({param})s"
+            self._params[param] = tuple(fold_case(v) for v in normalized_value)
+            return f"{exists_predicate} AND {eq_lhs} NOT IN %({param})s"
 
         if filter_op == "contains":
             param = self._next_param("attr")
             self._params[param] = f"%{normalized_value}%"
-            return f"{exists_predicate} AND {column_access} LIKE %({param})s"
+            return f"{exists_predicate} AND {column_access} {like_op} %({param})s"
         if filter_op == "not_contains":
             param = self._next_param("attr")
             self._params[param] = f"%{normalized_value}%"
-            return f"{exists_predicate} AND {column_access} NOT LIKE %({param})s"
+            return f"{exists_predicate} AND {column_access} {not_like_op} %({param})s"
         if filter_op == "starts_with":
             param = self._next_param("attr")
             self._params[param] = f"{normalized_value}%"
-            return f"{exists_predicate} AND {column_access} LIKE %({param})s"
+            return f"{exists_predicate} AND {column_access} {like_op} %({param})s"
         if filter_op == "ends_with":
             param = self._next_param("attr")
             self._params[param] = f"%{normalized_value}"
-            return f"{exists_predicate} AND {column_access} LIKE %({param})s"
+            return f"{exists_predicate} AND {column_access} {like_op} %({param})s"
 
         if filter_op == "between":
             param_lo = self._next_param("lo")
@@ -824,11 +841,15 @@ class ClickHouseFilterBuilder:
 
         raise ValueError(f"Unhandled filter_op {filter_op!r}")
 
-    # Columns whose stored values vary in case across ingest paths — OTel
-    # writes lowercase ('ok'/'error'/'unset'), older provider integrations
-    # wrote uppercase, and the TraceFilterPanel's static enum choices send
-    # uppercase labels. Matches must be case-insensitive on both sides.
-    _CASE_INSENSITIVE_COLUMNS = {"status", "observation_type"}
+
+    _CASE_INSENSITIVE_COLUMNS = {
+        "status",
+        "observation_type",
+        "name",
+        "trace_name",
+        "model",
+        "provider",
+    }
 
     _NULLABLE_UUID_COLUMNS = frozenset({
         "end_user_id",
@@ -845,7 +866,7 @@ class ClickHouseFilterBuilder:
     ) -> Optional[str]:
         """Build a condition for a direct column reference."""
         param = self._next_param("col")
-        ci = column in self._CASE_INSENSITIVE_COLUMNS
+        case_insensitive = column in self._CASE_INSENSITIVE_COLUMNS
 
         if filter_op == "is_null":
             if column in self._NULLABLE_UUID_COLUMNS:
@@ -857,16 +878,20 @@ class ClickHouseFilterBuilder:
             return f"({column} IS NOT NULL AND {column} != '')"
         elif filter_op == "contains":
             self._params[param] = f"%{filter_value}%"
-            return f"{column} LIKE %({param})s"
+            like_op = "ILIKE" if case_insensitive else "LIKE"
+            return f"{column} {like_op} %({param})s"
         elif filter_op == "not_contains":
             self._params[param] = f"%{filter_value}%"
-            return f"{column} NOT LIKE %({param})s"
+            like_op = "NOT ILIKE" if case_insensitive else "NOT LIKE"
+            return f"{column} {like_op} %({param})s"
         elif filter_op == "starts_with":
             self._params[param] = f"{filter_value}%"
-            return f"{column} LIKE %({param})s"
+            like_op = "ILIKE" if case_insensitive else "LIKE"
+            return f"{column} {like_op} %({param})s"
         elif filter_op == "ends_with":
             self._params[param] = f"%{filter_value}"
-            return f"{column} LIKE %({param})s"
+            like_op = "ILIKE" if case_insensitive else "LIKE"
+            return f"{column} {like_op} %({param})s"
         elif filter_op == "between" and isinstance(filter_value, list):
             p_lo = self._next_param("lo")
             p_hi = self._next_param("hi")
@@ -887,7 +912,7 @@ class ClickHouseFilterBuilder:
             # value IN [] matches nothing.
             if not values:
                 return "0 = 1"
-            if ci:
+            if case_insensitive:
                 values = [str(v).lower() for v in values]
                 self._params[param] = tuple(values)
                 return f"lower({column}) IN %({param})s"
@@ -900,7 +925,7 @@ class ClickHouseFilterBuilder:
             # value NOT IN [] should not restrict results.
             if not values:
                 return "1 = 1"
-            if ci:
+            if case_insensitive:
                 values = [str(v).lower() for v in values]
                 self._params[param] = tuple(values)
                 return f"lower({column}) NOT IN %({param})s"
@@ -910,7 +935,11 @@ class ClickHouseFilterBuilder:
             op = self._sql_op(filter_op)
             if op is None:
                 return "0 = 1"
-            if ci and op in ("=", "!=") and isinstance(filter_value, str):
+            if (
+                case_insensitive
+                and op in ("=", "!=")
+                and isinstance(filter_value, str)
+            ):
                 self._params[param] = filter_value.lower()
                 return f"lower({column}) {op} %({param})s"
             self._params[param] = filter_value
@@ -1059,6 +1088,7 @@ class ClickHouseFilterBuilder:
                 f"SELECT {inner_col} FROM tracer_eval_logger FINAL "
                 f"WHERE custom_eval_config_id IN %({param_cfg})s "
                 f"AND _peerdb_is_deleted = 0 "
+                f"AND (deleted = 0 OR deleted IS NULL) "
                 f"{error_clause} "
                 f"AND {match_condition}"
                 f")"
@@ -1519,7 +1549,8 @@ class ClickHouseFilterBuilder:
             "trace_id IN ("
             "SELECT DISTINCT toString(el.trace_id) FROM tracer_eval_logger AS el FINAL "
             f"INNER JOIN {self.table} AS sp ON sp.trace_id = toString(el.trace_id) "
-            "WHERE el._peerdb_is_deleted = 0 AND el.trace_id IS NOT NULL "
+            "WHERE el._peerdb_is_deleted = 0 AND (el.deleted = 0 OR el.deleted IS NULL) "
+            "AND el.trace_id IS NOT NULL "
             "AND sp._peerdb_is_deleted = 0 "
             "AND sp.project_id = %(project_id)s)"
         )

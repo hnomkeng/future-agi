@@ -39,6 +39,8 @@ import {
   isAudioUrlString,
   isRecordingObjectKey,
 } from "src/components/inline-audio/audio-detection";
+import { ID_ONLY_FIELDS } from "src/sections/projects/LLMTracing/idFields";
+import { NULL_OPERATORS } from "src/components/ComplexFilter/common";
 
 // ───────────────────────────────────────────────────────────────
 // Helpers (ported from TracingTestMode)
@@ -50,12 +52,9 @@ const COL_TYPE_MAP = {
   annotation: "ANNOTATION",
 };
 
-// Direct id columns the backend resolves without col_type — injecting one
-// routes the filter through the metrics pipeline and silently returns 0.
-const ID_COLUMNS = new Set(["trace_id", "span_id"]);
-
 const RANGE_OPS = new Set(["between", "not_between"]);
 const LIST_OPS = new Set(["in", "not_in"]);
+const NO_VALUE_OPS = new Set(NULL_OPERATORS);
 
 // Form rows from `TaskFilterBar.convertNewToOld` carry scalar `filterValue`
 // for single-value ops and arrays for `in`/`not_in`/`between`/`not_between`.
@@ -101,12 +100,14 @@ function mergeRowsByFieldAndOp(rows) {
 export function buildApiFilterArray(oldFormatFilters, startDate, endDate) {
   const userFilters = mergeRowsByFieldAndOp(oldFormatFilters || []).map(
     (entry) => {
-      const isIdColumn = ID_COLUMNS.has(entry.columnId);
+      const isIdColumn = ID_ONLY_FIELDS.has(entry.columnId);
       const colType =
         COL_TYPE_MAP[entry.fieldCategory] ||
         (entry.isAttribute ? "SPAN_ATTRIBUTE" : "SYSTEM_METRIC");
       let filterValue;
-      if (RANGE_OPS.has(entry.op)) {
+      if (NO_VALUE_OPS.has(entry.op)) {
+        filterValue = "";
+      } else if (RANGE_OPS.has(entry.op)) {
         filterValue = entry.value;
       } else if (LIST_OPS.has(entry.op)) {
         filterValue = entry.values;
@@ -1041,14 +1042,22 @@ const RowDetailTable = ({
                   "&:hover": { backgroundColor: "action.hover" },
                 }}
               >
-                <Typography
-                  variant="caption"
-                  fontWeight={500}
-                  noWrap
-                  sx={{ width: 130, flexShrink: 0, pt: 0.25 }}
+                <CustomTooltip
+                  title={key}
+                  show
+                  placement="top-start"
+                  arrow
+                  size="small"
                 >
-                  {key}
-                </Typography>
+                  <Typography
+                    variant="caption"
+                    fontWeight={500}
+                    noWrap
+                    sx={{ width: 130, flexShrink: 0, pt: 0.25 }}
+                  >
+                    {key}
+                  </Typography>
+                </CustomTooltip>
                 <Box sx={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
                   {isEmpty ? (
                     <Typography variant="caption" color="text.disabled">
@@ -1165,7 +1174,7 @@ const VariableMappingView = ({
         </Typography>
         <Typography
           variant="caption"
-          color="text.disabled"
+          color="text.secondary"
           sx={{ display: "block", fontSize: "10px" }}
         >
           Configured mapping for each eval against the current row&apos;s fields

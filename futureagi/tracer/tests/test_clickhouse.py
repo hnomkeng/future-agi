@@ -103,7 +103,9 @@ class TestClickHouseSchema:
         assert "allow_nullable_key = 1" in CDC_EVAL_LOGGER
 
         # New TRACE_SESSION_DICT exists and points at the trace_session table
-        assert "CREATE DICTIONARY IF NOT EXISTS trace_session_dict" in TRACE_SESSION_DICT
+        assert (
+            "CREATE DICTIONARY IF NOT EXISTS trace_session_dict" in TRACE_SESSION_DICT
+        )
         assert "trace_session" in TRACE_SESSION_DICT
         assert "project_id UUID" in TRACE_SESSION_DICT
 
@@ -488,7 +490,7 @@ class TestClickHouseFilterBuilder:
 
         where, params = builder.translate(filters)
 
-        assert "name IN" in where
+        assert "lower(name) IN" in where
         assert "span_attr_" not in where
         assert "trace_id IN" not in where
         assert tuple(params.values()) == (("response",),)
@@ -517,7 +519,7 @@ class TestClickHouseFilterBuilder:
         where, params = builder.translate(filters)
 
         assert "trace_id IN" in where
-        assert "name IN" in where
+        assert "lower(name) IN" in where
         assert "span_attr_" not in where
         assert "parent_span_id" not in where
         assert tuple(params.values()) == (("response",),)
@@ -546,7 +548,7 @@ class TestClickHouseFilterBuilder:
         where, params = builder.translate(filters)
 
         assert "trace_id IN" in where
-        assert "name IN" in where
+        assert "lower(name) IN" in where
         assert "parent_span_id IS NULL OR parent_span_id = ''" in where
         assert tuple(params.values()) == (("root trace",),)
 
@@ -996,9 +998,7 @@ class TestClickHouseFilterBuilder:
         assert "output_float IS NOT NULL" in where
 
     @pytest.mark.django_db
-    def test_translate_pass_fail_eval_filter_uses_output_bool(
-        self, custom_eval_config
-    ):
+    def test_translate_pass_fail_eval_filter_uses_output_bool(self, custom_eval_config):
         """Pass/fail evals must use output_bool, not stale mixed fields."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
@@ -2165,6 +2165,77 @@ class TestSessionListQueryBuilder:
         query2, _ = builder2.build_count_query()
         assert "count() AS total" in query2
         assert "GROUP BY" in query2
+
+    def test_build_excludes_nil_uuid(self):
+        """build() should exclude the ClickHouse nil UUID from session results."""
+        from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
+
+        builder = SessionListQueryBuilder(
+            project_id="test-project-id",
+            filters=[],
+            page_number=0,
+            page_size=10,
+        )
+        query, _ = builder.build()
+        assert "00000000-0000-0000-0000-000000000000" in query
+
+    def test_count_query_excludes_nil_uuid(self):
+        """Both simple and aggregated count queries should exclude the nil UUID."""
+        from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
+
+        # Simple count path
+        builder = SessionListQueryBuilder(
+            project_id="test-project-id",
+            filters=[],
+            page_number=0,
+            page_size=10,
+        )
+        builder.build()
+        query, _ = builder.build_count_query()
+        assert "00000000-0000-0000-0000-000000000000" in query
+
+        # Aggregated count path
+        builder2 = SessionListQueryBuilder(
+            project_id="test-project-id",
+            filters=[
+                {
+                    "column_id": "duration",
+                    "filter_config": {
+                        "filter_op": "greater_than",
+                        "filter_value": 60,
+                    },
+                }
+            ],
+            page_number=0,
+            page_size=10,
+        )
+        builder2.build()
+        query2, _ = builder2.build_count_query()
+        assert "00000000-0000-0000-0000-000000000000" in query2
+
+    def test_format_sessions_skips_nil_uuid(self):
+        """format_sessions() should drop rows with the nil UUID session_id."""
+        from datetime import datetime
+
+        from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
+
+        columns = [
+            "session_id",
+            "session_start",
+            "session_end",
+            "duration",
+            "total_cost",
+            "total_tokens",
+            "traces_count",
+        ]
+        now = datetime.utcnow()
+        rows = [
+            ("00000000-0000-0000-0000-000000000000", now, now, 0, 0.0, 0, 1),
+            ("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", now, now, 10, 1.5, 100, 3),
+        ]
+        result = SessionListQueryBuilder.format_sessions(rows, columns)
+        assert len(result) == 1
+        assert result[0]["session_id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 
 @pytest.mark.unit
@@ -4556,7 +4627,7 @@ class TestFilterBuilderEdgeCases:
         assert "!=" in where
 
     def test_not_contains_filter(self):
-        """not_contains should produce NOT LIKE."""
+        """not_contains should produce NOT ILIKE (case-insensitive)."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -4574,7 +4645,7 @@ class TestFilterBuilderEdgeCases:
             }
         ]
         where, _ = builder.translate(filters)
-        assert "NOT LIKE" in where
+        assert "NOT ILIKE" in where
 
     def test_starts_with_filter(self):
         """starts_with should produce LIKE with trailing %."""
@@ -4700,7 +4771,7 @@ class TestFilterBuilderEdgeCases:
         assert "<=" in where
 
     def test_span_attr_not_contains(self):
-        """SPAN_ATTRIBUTE not_contains should produce NOT LIKE."""
+        """SPAN_ATTRIBUTE not_contains should produce NOT ILIKE (case-insensitive)."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -4718,7 +4789,7 @@ class TestFilterBuilderEdgeCases:
             }
         ]
         where, _ = builder.translate(filters)
-        assert "NOT LIKE" in where
+        assert "NOT ILIKE" in where
         assert "span_attr_str" in where
 
     def test_span_attr_between(self):
@@ -5227,7 +5298,7 @@ class TestVoiceCallListQueryBuilder:
         )
         query, params = builder.build_eval_query(["trace-1", "trace-2"])
         assert "tracer_eval_logger" in query
-        assert "avg(output_float)" in query
+        assert "avgIf" in query
         assert params["trace_ids"] == ("trace-1", "trace-2")
         assert params["eval_config_ids"] == ("eval-1", "eval-2")
 
@@ -5244,6 +5315,118 @@ class TestVoiceCallListQueryBuilder:
         query, params = builder.build_eval_query([])
         assert query == ""
         assert params == {}
+
+    def test_eval_query_filters_errored_rows(self):
+        """Eval query should exclude errored rows from score aggregation."""
+        from tracer.services.clickhouse.query_builders.voice_call_list import (
+            VoiceCallListQueryBuilder,
+        )
+
+        builder = VoiceCallListQueryBuilder(
+            project_id="proj-1",
+            eval_config_ids=["eval-1"],
+        )
+        query, _ = builder.build_eval_query(["trace-1"])
+        assert "error = 0" in query
+        assert "success_count" in query
+        assert "error_count" in query
+
+    def test_eval_query_returns_8_columns(self):
+        """Eval query should return all 8 columns expected by pivot_eval_results."""
+        from tracer.services.clickhouse.query_builders.voice_call_list import (
+            VoiceCallListQueryBuilder,
+        )
+
+        builder = VoiceCallListQueryBuilder(
+            project_id="proj-1",
+            eval_config_ids=["eval-1"],
+        )
+        query, _ = builder.build_eval_query(["trace-1"])
+        for col_name in [
+            "avg_score",
+            "pass_rate",
+            "success_count",
+            "error_count",
+            "eval_count",
+            "str_lists",
+        ]:
+            assert col_name in query, f"Missing column: {col_name}"
+
+    def test_pivot_eval_results_all_errored(self):
+        """When all evals errored, pivot should return error marker."""
+        from tracer.services.clickhouse.query_builders.trace_list import (
+            TraceListQueryBuilder,
+        )
+
+        rows = [
+            ("t1", "cfg-1", None, None, 0, 3, 3, []),
+        ]
+        columns = [
+            "trace_id",
+            "eval_config_id",
+            "avg_score",
+            "pass_rate",
+            "success_count",
+            "error_count",
+            "eval_count",
+            "str_lists",
+        ]
+        result = TraceListQueryBuilder.pivot_eval_results(rows, columns)
+        assert result["t1"]["cfg-1"] == {"error": True}
+
+    def test_pivot_eval_results_partial_errors(self):
+        """When some evals succeed and some error, should return scores not error."""
+        from tracer.services.clickhouse.query_builders.trace_list import (
+            TraceListQueryBuilder,
+        )
+
+        rows = [
+            ("t1", "cfg-1", 0.75, None, 2, 1, 3, []),
+        ]
+        columns = [
+            "trace_id",
+            "eval_config_id",
+            "avg_score",
+            "pass_rate",
+            "success_count",
+            "error_count",
+            "eval_count",
+            "str_lists",
+        ]
+        result = TraceListQueryBuilder.pivot_eval_results(rows, columns)
+        assert result["t1"]["cfg-1"]["avg_score"] == 75.0
+        assert "error" not in result["t1"]["cfg-1"]
+
+    def test_pivot_eval_results_error_with_dict_rows(self):
+        """Error detection should work with dict-style rows from CH client."""
+        from tracer.services.clickhouse.query_builders.trace_list import (
+            TraceListQueryBuilder,
+        )
+
+        rows = [
+            {
+                "trace_id": "t1",
+                "eval_config_id": "cfg-1",
+                "avg_score": None,
+                "pass_rate": None,
+                "success_count": 0,
+                "error_count": 5,
+                "eval_count": 5,
+                "str_lists": [],
+            }
+        ]
+        columns = [
+            "trace_id",
+            "eval_config_id",
+            "avg_score",
+            "pass_rate",
+            "success_count",
+            "error_count",
+            "eval_count",
+            "str_lists",
+        ]
+        result = TraceListQueryBuilder.pivot_eval_results(rows, columns)
+        assert result["t1"]["cfg-1"] == {"error": True}
 
     def test_annotation_query(self):
         """Phase 3 annotation query should filter by trace_ids and label_ids."""
@@ -6842,7 +7025,9 @@ class TestSessionAnalyticsQueryBuilder:
         assert "trace_session_id" in query
         assert "GROUP BY trace_session_id" in query
         assert "ORDER BY started_at DESC" in query
-        assert "trace_session_id != ''" in query
+        # UUID-vs-empty-string makes CH raise Code 376 (Cannot parse uuid).
+        assert "trace_session_id != ''" not in query
+        assert "trace_session_id IS NOT NULL" in query
 
     def test_session_navigation_has_aggregate_columns(self):
         """Navigation query should include count, tokens, cost."""
@@ -6851,6 +7036,12 @@ class TestSessionAnalyticsQueryBuilder:
         assert "count(DISTINCT trace_id)" in query
         assert "sum(total_tokens)" in query
         assert "sum(cost)" in query
+
+    def test_session_navigation_excludes_nil_uuid(self):
+        """Navigation query should exclude the ClickHouse nil UUID."""
+        builder = self._make_builder()
+        query, _ = builder.build_session_navigation_query()
+        assert "00000000-0000-0000-0000-000000000000" in query
 
     # -- User stats query --
 
@@ -7043,7 +7234,7 @@ class TestSpanAttrConditionContract:
                 "k", filter_type="text", filter_op="not_equals", filter_value="v"
             )
         )
-        assert "AND span_attr_str['k'] != " in where
+        assert "AND lower(span_attr_str['k']) != " in where
         assert "NOT mapContains" not in where
 
     def test_text_in(self):
@@ -7052,7 +7243,7 @@ class TestSpanAttrConditionContract:
                 "k", filter_type="text", filter_op="in", filter_value=["a", "b"]
             )
         )
-        assert "span_attr_str['k'] IN" in where
+        assert "lower(span_attr_str['k']) IN" in where
         assert ("a", "b") in params.values()
 
     def test_text_not_in_uses_exists_and(self):
@@ -7067,7 +7258,7 @@ class TestSpanAttrConditionContract:
             )
         )
         assert "mapContains(span_attr_str, 'ended_reason')" in where
-        assert "AND span_attr_str['ended_reason'] NOT IN" in where
+        assert "AND lower(span_attr_str['ended_reason']) NOT IN" in where
         assert "NOT mapContains" not in where
         assert ("voicemail", "assistant-ended-call") in params.values()
 
@@ -7086,7 +7277,7 @@ class TestSpanAttrConditionContract:
                 "k", filter_type="text", filter_op="not_contains", filter_value="abc"
             )
         )
-        assert "AND span_attr_str['k'] NOT LIKE" in where
+        assert "AND span_attr_str['k'] NOT ILIKE" in where
         assert "NOT mapContains" not in where
         assert "%abc%" in params.values()
 

@@ -2,6 +2,7 @@ import json
 import time
 import traceback
 import uuid
+from decimal import Decimal
 
 import structlog
 from django.db import close_old_connections
@@ -23,10 +24,7 @@ from sdk.utils.helpers import _get_api_call_type
 from tfc.middleware.workspace_context import get_current_organization
 from tfc.temporal import temporal_activity
 from tfc.utils.error_codes import get_specific_error_message
-try:
-    from ee.usage.models.usage import APICallStatusChoices
-except ImportError:
-    APICallStatusChoices = None
+from tfc.constants.api_calls import APICallStatusChoices
 try:
     from ee.usage.utils.usage_entries import log_and_deduct_cost_for_api_request
 except ImportError:
@@ -224,7 +222,7 @@ def run_eval_func(
         _is_code_eval = getattr(template, "eval_type", "") == "code"
         api_call_type = (
             BillingEventType.CODE_EVALUATOR.value
-            if _is_code_eval
+            if _is_code_eval and BillingEventType is not None
             else _get_api_call_type(model)
         )
 
@@ -241,7 +239,10 @@ def run_eval_func(
         if check_usage is not None:
             usage_check = check_usage(str(org.id), api_call_type)
             if not usage_check.allowed:
-                raise UsageLimitExceeded(usage_check)
+                if UsageLimitExceeded is not None:
+                    raise UsageLimitExceeded(usage_check)
+                else:
+                    raise ValueError(str(usage_check))
 
         if log_and_deduct_cost_for_api_request is not None:
             api_call_log_row = log_and_deduct_cost_for_api_request(
@@ -336,6 +337,18 @@ def run_eval_func(
 
             _run_kwargs = preprocess_inputs(template.name, _run_kwargs)
 
+        # Apply the shared empty-input rules so the playground (and
+        # every other caller of run_eval_func — composite children,
+        # protect, simulation) behaves the same way as the dataset path.
+        # The validator also normalizes kwargs for custom evals so the
+        # underlying engine doesn't raise "Missing required key" when
+        # the caller omits unmapped variables.
+        from model_hub.utils.eval_input_validation import validate_eval_inputs
+
+        partial_input_warning, _run_kwargs = validate_eval_inputs(
+            template, _run_kwargs
+        )
+
         eval_result = eval_instance.run(**_run_kwargs)
         end_time = time.time()
 
@@ -356,6 +369,8 @@ def run_eval_func(
                 else config.get("output", "choices")
             ),
         }
+        if partial_input_warning:
+            response["warnings"] = [partial_input_warning]
         # logger.info(f"response*******: {response}")
 
         metadata = response.get("metadata")
@@ -372,9 +387,15 @@ def run_eval_func(
         if api_call_log_row is None:
             return response
         config_dict = json.loads(api_call_log_row.config)
+        output_payload = {"output": value, "reason": response["reason"]}
+        # Mirror the dataset path: propagate partial-input warnings into
+        # the API call log so the eval usage view (which reads APICallLog)
+        # can surface them alongside the eval's output.
+        if response.get("warnings"):
+            output_payload["warnings"] = response["warnings"]
         config_dict.update(
             {
-                "output": {"output": value, "reason": response["reason"]},
+                "output": output_payload,
                 "input": response["data"],
             }
         )
@@ -401,40 +422,75 @@ def run_eval_func(
                 from ee.usage.services.emitter import emit
             except ImportError:
                 emit = None
+            try:
+                from ee.usage.utils.event_properties import token_usage_properties
+            except ImportError:
+                token_usage_properties = lambda token_usage: {}
 
-            billing_config = BillingConfig.get()
+            billing_config = None
+            if BillingConfig is not None:
+                billing_config = BillingConfig.get()
             eval_cost = getattr(eval_instance, "cost", {})
             llm_cost = eval_cost.get("total_cost", 0)
-            per_run_fee = billing_config.get_eval_per_run_fee()
+            per_run_fee = billing_config.get_eval_per_run_fee() if billing_config else 0
             actual_cost = llm_cost + per_run_fee
+            _token_usage = getattr(eval_instance, "token_usage", {})
 
-            # Fallback cost for comparison logging
+            # Fallback cost for comparison logging and composite eval billing.
+            # Composite children can return token usage with a zero `cost`;
+            # in that case, charge model token pricing plus the per-run fee.
             _fallback_cost = 0
+            _pricing_source = ""
             try:
                 from agentic_eval.core_evals.fi_utils.token_count_helper import (
                     calculate_total_cost,
                 )
 
-                _token_usage = getattr(eval_instance, "token_usage", {})
-                _fallback = calculate_total_cost(model or "unknown", _token_usage)
+                pricing_model = (
+                    model
+                    or getattr(template, "model", None)
+                    or ModelChoices.TURING_LARGE.value
+                )
+                _fallback = calculate_total_cost(pricing_model, _token_usage)
                 _fallback_cost = _fallback.get("total_cost", 0)
+                _pricing_source = _fallback.get("pricing_source", "")
             except Exception:
                 pass
+
+            is_composite_source = source in {
+                "composite_eval",
+                "composite_eval_adhoc",
+                "composite_eval_dataset",
+                "tracer_composite",
+            }
+            cost_properties = {}
+            if is_composite_source and not llm_cost and _fallback_cost:
+                actual_cost = Decimal(str(_fallback_cost)) + Decimal(str(per_run_fee))
+                cost_properties = {
+                    "llm_cost_usd": str(_fallback_cost),
+                    "reported_llm_cost_usd": str(llm_cost),
+                    "llm_cost_source": "token_pricing",
+                    "pricing_source": _pricing_source,
+                }
 
             logger.info(
                 "eval_cost_breakdown",
                 template=template.name,
                 model=model,
-                llm_cost=llm_cost,
+                llm_cost=cost_properties.get("llm_cost_usd", llm_cost),
                 per_run_fee=per_run_fee,
                 actual_cost=actual_cost,
                 fallback_calculated_cost=_fallback_cost,
+                llm_cost_source=cost_properties.get("llm_cost_source"),
                 token_usage=getattr(eval_instance, "token_usage", {}),
             )
 
-            credits = billing_config.calculate_ai_credits(actual_cost)
+            credits = billing_config.calculate_ai_credits(actual_cost) if billing_config else 0
 
-            emit(
+            if emit is not None and UsageEvent is not None and BillingEventType is not None:
+
+
+                emit(
                 UsageEvent(
                     org_id=str(org.id),
                     event_type=api_call_type,
@@ -443,6 +499,8 @@ def run_eval_func(
                         "source": source,
                         "source_id": str(template.id),
                         "raw_cost_usd": str(actual_cost),
+                        **cost_properties,
+                        **token_usage_properties(_token_usage),
                     },
                 )
             )
@@ -456,6 +514,10 @@ def run_eval_func(
         output["metadata"] = response.get("metadata")
         output["output_type"] = template.config.get("output")
         output["log_id"] = str(api_call_log_row.log_id)
+        # Pass partial-input warning through to the playground UI so the
+        # yellow ⚠ badge can render alongside the result.
+        if response.get("warnings"):
+            output["warnings"] = response["warnings"]
 
         if error_localizer:
             from model_hub.tasks.user_evaluation import (

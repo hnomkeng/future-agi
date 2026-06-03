@@ -72,6 +72,7 @@ import { format } from "date-fns";
 import {
   buildEvalTemplateConfig,
   buildCompositeSourceModeProps,
+  buildDataInjection,
   contextOptionsForRowType,
   extractCodeEvaluateParams,
   getSourceModeVariables,
@@ -387,8 +388,8 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
         evalData?.config?.run_config ||
         evalData?.config?.runConfig ||
         {};
-        
-     const normalizedRunConfig = {
+
+      const normalizedRunConfig = {
         ...rawRunConfig,
         agent_mode:
           rawRunConfig.agent_mode ??
@@ -529,13 +530,13 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
           setContextOptions(["variables_only"]);
         }
       } else if (source === "task") {
-      const seeded = contextOptionsForRowType(sourceRowType);
+        const seeded = contextOptionsForRowType(sourceRowType);
         if (seeded) setContextOptions(seeded);
       }
       setErrorLocalizerEnabled(
         config.error_localizer_enabled ??
-          fullEval.error_localizer_enabled ??
-          false,
+        fullEval.error_localizer_enabled ??
+        false,
       );
 
       // Edit mode: keep the saved name. Create mode: generate a unique name
@@ -555,8 +556,11 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
           .replace(/[^a-z0-9_-]/g, "");
         const sourceSlug = SOURCE_NAME_SLUGS[source] || "";
         const stamp = format(new Date(), "dd_MMM_yyyy_HH_mm").toLowerCase();
+        const suffix = [sourceSlug, stamp].filter(Boolean).join("_");
+        const maxBaseLen = Math.max(0, 50 - suffix.length - (suffix ? 1 : 0));
+        const truncatedBase = sanitized.slice(0, maxBaseLen).replace(/_+$/, "");
         setEvalName(
-          [sanitized, sourceSlug, stamp].filter(Boolean).join("_"),
+          [truncatedBase, sourceSlug, stamp].filter(Boolean).join("_"),
         );
       }
 
@@ -627,8 +631,8 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
         setUseInternet(fullEval.config?.check_internet ?? false);
         setErrorLocalizerEnabled(
           fullEval.error_localizer_enabled ??
-            fullEval.config?.error_localizer_enabled ??
-            false,
+          fullEval.config?.error_localizer_enabled ??
+          false,
         );
         setIsDirty(false);
         return;
@@ -834,35 +838,19 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
         );
         return;
       }
-    if (evalType === "llm" && !hasValidPromptMessages) {
-      const errorMessage = "Prompt message is required";
-      setPromptMessageError(errorMessage);
-      enqueueSnackbar(errorMessage, { variant: "error" });
-      return;
+      if (evalType === "llm" && !hasValidPromptMessages) {
+        const errorMessage = "Prompt message is required";
+        setPromptMessageError(errorMessage);
+        enqueueSnackbar(errorMessage, { variant: "error" });
+        return;
+      }
     }
-  }
 
     if (source === "task" && onFiltersChange) {
       onFiltersChange(localFilterForm.getValues("filters") || []);
     }
 
-    // Build a data_injection config from context options.
-    const dataInjection = (() => {
-      if (
-        contextOptions.length === 0 ||
-        (contextOptions.length === 1 && contextOptions[0] === "variables_only")
-      ) {
-        return { variables_only: true };
-      }
-      const flags = {};
-      if (contextOptions.includes("dataset_row")) flags.full_row = true;
-      if (contextOptions.includes("span_context")) flags.span_context = true;
-      if (contextOptions.includes("trace_context")) flags.trace_context = true;
-      if (contextOptions.includes("session_context")) flags.session_context = true;
-      if (contextOptions.includes("call_context")) flags.call_context = true;
-      if (contextOptions.includes("full_row")) flags.full_row = true;
-      return Object.keys(flags).length > 0 ? flags : { full_row: true };
-    })();
+    const dataInjection = buildDataInjection(contextOptions);
     const tools = build_tools_payload(connectorIds);
 
     const templateType =
@@ -1133,7 +1121,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
 
       {/* ── Eval Name ── */}
       <Box sx={{ py: 1.5, flexShrink: 0 }}>
-        <Typography variant="body2" fontWeight={600} sx={{ mb: 0.5 }}>
+        <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
           Name<span style={{ color: "#d32f2f" }}>*</span>
         </Typography>
         <TextField
@@ -1151,7 +1139,15 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
             setEvalName(raw);
             setIsDirty(true);
           }}
-          inputProps={{ maxLength: 60 }}
+          error={!isEditMode && evalName.length >= 51}
+          helperText={
+            isEditMode
+              ? undefined
+              : evalName.length >= 51
+                ? "Name can't be longer than 50 characters"
+                : `Lowercase letters, numbers, hyphens and underscores only · ${evalName.length}/50`
+          }
+          FormHelperTextProps={{ sx: { fontSize: "11px", mt: 0.25, mx: 0 } }}
           sx={{ "& .MuiInputBase-root": { fontSize: "13px", height: 34 } }}
         />
       </Box>
@@ -1398,6 +1394,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
                     setContextOptions(v);
                     setIsDirty(true);
                   }}
+                  hideDatasetContextToggle={source === "task"}
                 />
               )}
 
@@ -1429,6 +1426,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
                     datasetColumns={datasetColumns}
                     datasetJsonSchemas={datasetJsonSchemas}
                     disabled={isInstructionsReadOnly}
+                    modelSelectorDisabled={false}
                   />
                   <FewShotExamples
                     selectedDatasets={fewShotExamples}
@@ -1467,19 +1465,38 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
               {/* Output Type (not applicable to composites) */}
               {isComposite ? null : evalType === "code" ? (
                 <Box>
-                  <Typography variant="body2" fontWeight={600} sx={{ mb: 0.5 }}>
+                  <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
                     Scoring
+                  </Typography>
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    sx={{ mb: 1.5, display: "block" }}
+                  >
+                    Code evaluator returns a score between 0 and 1. Set a pass
+                    threshold below.
+                  </Typography>
+                  <Typography variant="subtitle2"  sx={{ mb: 0.5,color:"text.primary" }}>
+                    Pass Threshold
+                  </Typography>
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    sx={{ mb: 1, display: "block" }}
+                  >
+                    Scores at or above this threshold are considered a pass.
                   </Typography>
                   <Box
                     sx={{
                       display: "flex",
                       alignItems: "center",
                       gap: 2,
+                      px: 1,
                     }}
                   >
                     <Typography variant="caption">0</Typography>
                     <Slider
-                      value={passThreshold * 100}
+                      value={Math.round(passThreshold * 100)}
                       onChange={(_, val) => {
                         setPassThreshold(val / 100);
                         setIsDirty(true);
@@ -1624,27 +1641,27 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
                   source === "workbench" ||
                   source === "run-experiment" ||
                   source === "run-optimization") && (
-                  <DatasetTestMode
-                    ref={sourceRef}
-                    templateId={templateId}
-                    variables={variables}
-                    model={model}
-                    codeParams={codeParams}
-                    onTestResult={handleTestResult}
-                    onClearResult={handleClearTestResult}
-                    onColumnsLoaded={handleColumnsLoaded}
-                    initialDatasetId={sourceId}
-                    onReadyChange={handleSourceReadyChange}
-                    contextOptions={contextOptions}
-                    errorLocalizerEnabled={errorLocalizerEnabled}
-                    initialMapping={evalData?.mapping}
-                    {...compositeSourceModeProps}
-                    sourceColumns={
-                      source === "workbench" ? sourceColumns : null
-                    }
-                    extraColumns={extraColumns}
-                  />
-                )}
+                    <DatasetTestMode
+                      ref={sourceRef}
+                      templateId={templateId}
+                      variables={variables}
+                      model={model}
+                      codeParams={codeParams}
+                      onTestResult={handleTestResult}
+                      onClearResult={handleClearTestResult}
+                      onColumnsLoaded={handleColumnsLoaded}
+                      initialDatasetId={sourceId}
+                      onReadyChange={handleSourceReadyChange}
+                      contextOptions={contextOptions}
+                      errorLocalizerEnabled={errorLocalizerEnabled}
+                      initialMapping={evalData?.mapping}
+                      {...compositeSourceModeProps}
+                      sourceColumns={
+                        source === "workbench" ? sourceColumns : null
+                      }
+                      extraColumns={extraColumns}
+                    />
+                  )}
                 {source === "tracing" && (
                   <TracingTestMode
                     ref={sourceRef}
@@ -1655,6 +1672,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
                     onClearResult={handleClearTestResult}
                     onColumnsLoaded={handleColumnsLoaded}
                     onReadyChange={handleSourceReadyChange}
+                    hasDataInjection={hasDataInjection}
                     errorLocalizerEnabled={errorLocalizerEnabled}
                     initialMapping={evalData?.mapping}
                     {...compositeSourceModeProps}
@@ -1698,6 +1716,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
                     onClearResult={handleClearTestResult}
                     onColumnsLoaded={handleColumnsLoaded}
                     onReadyChange={handleSourceReadyChange}
+                    hasDataInjection={hasDataInjection}
                     initialProjectId={sourceId}
                     initialRowType={sourceRowType}
                     initialMapping={evalData?.mapping}
@@ -1746,12 +1765,14 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
                     model={model}
                     functionParamsSchema={functionParamsSchema}
                     configParamsDesc={configParamsDesc}
+                    codeParams={codeParams}
+                    onCodeParamsChange={setCodeParams}
                   />
                 )}
 
                 {source !== "composite" && visibleCodeParamEntries.length > 0 && (
                   <Box sx={{ mt: 2 }}>
-                    <Typography variant="body2" fontWeight={600} sx={{ mb: 1 }}>
+                    <Typography variant="subtitle2" sx={{ mb: 1 }}>
                       Parameters
                     </Typography>
                     {visibleCodeParamEntries.map(([key, schema]) => (
@@ -1846,12 +1867,11 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
             settings only. */}
         {source !== "composite" &&
           !sourceReady &&
-          !hasDataInjection &&
           !testError &&
           !testPassed && (
             <Typography
               variant="caption"
-              color="text.disabled"
+              color="text.secondary"
               sx={{ mr: "auto", fontSize: "11px" }}
             >
               Map all variables to enable testing & adding
@@ -1917,14 +1937,14 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
                 : "Your Mustache template has no variables. Add a {{variable}} placeholder (e.g. {{input}}) so test input can be passed in.";
           }
 
-          if (!testDisabled && !sourceReady && !hasDataInjection) {
+          if (!testDisabled && !sourceReady) {
             testDisabled = true;
             testDisabledReason = "Map all variables before running a test.";
           }
 
           return (
             <ShowComponent
-              condition={!hasDataInjection }
+              condition={!hasDataInjection}
             >
               <CustomTooltip
                 show={testDisabled && !!testDisabledReason}
@@ -2010,14 +2030,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
                 : `Your Mustache template has no variables. Add a {{variable}} placeholder (e.g. {{input}}) before ${actionLabel}.`;
           }
 
-          // Non-composite flows additionally require the full source config
-          // (name / output type / etc.) to be valid.
-          if (
-            !addDisabled &&
-            source !== "composite" &&
-            !sourceReady &&
-            !hasDataInjection
-          ) {
+          if (!addDisabled && source !== "composite" && !sourceReady) {
             addDisabled = true;
             addDisabledReason = `Map all variables before ${actionLabel}.`;
           }
