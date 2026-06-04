@@ -56,6 +56,7 @@ import {
   executeEvalForRow,
 } from "../utils/evalExecution";
 
+
 const ROW_TYPE_OPTIONS = [
   { value: "Span", label: "Spans", icon: "solar:layers-outline" },
   { value: "Trace", label: "Traces", icon: "solar:flow-outline" },
