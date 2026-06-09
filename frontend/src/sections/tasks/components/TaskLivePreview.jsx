@@ -45,26 +45,20 @@ import {
 } from "src/components/inline-audio/audio-detection";
 import { ID_ONLY_FIELDS } from "src/sections/projects/LLMTracing/idFields";
 import { NULL_OPERATORS } from "src/components/ComplexFilter/common";
+import {
+  ANNOTATION_COLUMN_IDS,
+  FIELD_CATEGORY_TO_COL_TYPE,
+} from "src/sections/common/EvalsTasks/common";
 
 // ───────────────────────────────────────────────────────────────
 // Helpers (ported from TracingTestMode)
 // ───────────────────────────────────────────────────────────────
-const COL_TYPE_MAP = {
-  attribute: "SPAN_ATTRIBUTE",
-  system: "SYSTEM_METRIC",
-  eval: "EVALUATION_METRIC",
-  annotation: "ANNOTATION",
-};
-
 const RANGE_OPS = new Set(["between", "not_between"]);
 const LIST_OPS = new Set(["in", "not_in"]);
 const NO_VALUE_OPS = new Set(NULL_OPERATORS);
 
-// Form rows from `TaskFilterBar.convertNewToOld` carry scalar `filterValue`
-// for single-value ops and arrays for `in`/`not_in`/`between`/`not_between`.
-// Multiple scalar rows for the same (field, op) need to be merged into one
-// wire entry so the BE `in` validator gets a single array clause instead of
-// N independently-evaluated scalar clauses.
+// Merge multiple scalar rows for the same (field, op) into one wire entry
+// so the BE `in` validator receives a single array clause.
 function mergeRowsByFieldAndOp(rows) {
   const merged = new Map();
   rows.forEach((f) => {
@@ -78,6 +72,7 @@ function mergeRowsByFieldAndOp(rows) {
       merged.set(key, {
         columnId,
         fieldCategory: f.fieldCategory,
+        apiColType: f.apiColType,
         op,
         filterType,
         isAttribute,
@@ -105,9 +100,12 @@ export function buildApiFilterArray(oldFormatFilters, startDate, endDate) {
   const userFilters = mergeRowsByFieldAndOp(oldFormatFilters || []).map(
     (entry) => {
       const isIdColumn = ID_ONLY_FIELDS.has(entry.columnId);
-      const colType =
-        COL_TYPE_MAP[entry.fieldCategory] ||
-        (entry.isAttribute ? "SPAN_ATTRIBUTE" : "SYSTEM_METRIC");
+      // apiColType is source of truth; fieldCategory/isAttribute are UI hints.
+      const colType = ANNOTATION_COLUMN_IDS.has(entry.columnId)
+        ? "ANNOTATION"
+        : entry.apiColType ||
+          FIELD_CATEGORY_TO_COL_TYPE[entry.fieldCategory] ||
+          (entry.isAttribute ? "SPAN_ATTRIBUTE" : "SYSTEM_METRIC");
       let filterValue;
       if (NO_VALUE_OPS.has(entry.op)) {
         filterValue = "";
